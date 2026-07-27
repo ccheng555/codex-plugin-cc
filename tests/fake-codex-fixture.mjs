@@ -16,6 +16,7 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	const { spawn } = require("node:child_process");
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -272,6 +273,13 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+if (BEHAVIOR === "with-helper-child") {
+  const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore"
+  });
+  helper.unref();
+  bootState.helperPids = [...(bootState.helperPids || []), helper.pid];
+}
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });

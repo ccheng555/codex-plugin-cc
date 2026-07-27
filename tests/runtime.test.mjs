@@ -2166,7 +2166,7 @@ test("shared broker releases its idle app-server child and restarts it on demand
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
 
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, "with-helper-child");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -2195,9 +2195,30 @@ test("shared broker releases its idle app-server child and restarts it on demand
         cwd: repo
       })
     });
+    if (fs.existsSync(fakeStatePath)) {
+      const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+      for (const helperPid of fakeState.helperPids || []) {
+        try {
+          process.kill(helperPid, "SIGTERM");
+        } catch {
+          // Ignore helpers already terminated with their app-server group.
+        }
+      }
+    }
   });
 
+  const firstFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const firstHelperPid = firstFakeState.helperPids?.[0];
+  assert.ok(firstHelperPid);
   await new Promise((resolve) => setTimeout(resolve, 300));
+  await waitFor(() => {
+    try {
+      process.kill(firstHelperPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
 
   const adversarial = run("node", [SCRIPT, "adversarial-review"], {
     cwd: repo,
@@ -2209,6 +2230,7 @@ test("shared broker releases its idle app-server child and restarts it on demand
   assert.equal(secondSession?.pid, firstSession.pid);
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 2);
+  assert.equal(fakeState.helperPids.length, 2);
 });
 
 test("setup reuses an existing shared app-server without starting another one", () => {

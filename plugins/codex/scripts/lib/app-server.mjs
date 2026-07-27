@@ -190,6 +190,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
@@ -243,23 +244,22 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();
-      setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // On Windows with shell: true, the direct child is cmd.exe.
-          // Use terminateProcessTree to kill the entire tree including
-          // the grandchild node process.
-          if (process.platform === "win32") {
+      if (process.platform === "win32") {
+        setTimeout(() => {
+          if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
             try {
               terminateProcessTree(this.proc.pid);
             } catch {
               // Best-effort cleanup inside an unref'd timer — swallow errors
               // to avoid crashing the host process during shutdown.
             }
-          } else {
-            this.proc.kill("SIGTERM");
           }
-        }
-      }, 50).unref?.();
+        }, 50).unref?.();
+      } else {
+        // The app-server is its own process-group leader on Unix. Terminate
+        // the group so MCP helpers cannot outlive the app-server parent.
+        terminateProcessTree(this.proc.pid);
+      }
     }
 
     await this.exitPromise;
