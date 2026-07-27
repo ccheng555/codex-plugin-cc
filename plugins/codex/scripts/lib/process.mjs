@@ -54,6 +54,53 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+function listDescendantPids(pid, runCommandImpl) {
+  const result = runCommandImpl("ps", ["-axo", "pid=,ppid="]);
+  if (result.error || result.status !== 0) {
+    return [];
+  }
+
+  const childrenByParent = new Map();
+  for (const line of result.stdout.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!match) {
+      continue;
+    }
+    const childPid = Number(match[1]);
+    const parentPid = Number(match[2]);
+    const children = childrenByParent.get(parentPid) ?? [];
+    children.push(childPid);
+    childrenByParent.set(parentPid, children);
+  }
+
+  const descendants = [];
+  const visit = (parentPid) => {
+    for (const childPid of childrenByParent.get(parentPid) ?? []) {
+      visit(childPid);
+      descendants.push(childPid);
+    }
+  };
+  visit(pid);
+  return descendants;
+}
+
+function terminateUnixProcessOrGroup(pid, killImpl) {
+  try {
+    killImpl(-pid, "SIGTERM");
+    return true;
+  } catch (groupError) {
+    try {
+      killImpl(pid, "SIGTERM");
+      return true;
+    } catch (processError) {
+      if (processError?.code === "ESRCH") {
+        return false;
+      }
+      throw processError?.code ? processError : groupError;
+    }
+  }
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
@@ -97,24 +144,12 @@ export function terminateProcessTree(pid, options = {}) {
     throw new Error(formatCommandFailure(result));
   }
 
-  try {
-    killImpl(-pid, "SIGTERM");
-    return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
-      }
-    }
-
-    return { attempted: true, delivered: false, method: "process-group" };
+  const targets = [...listDescendantPids(pid, runCommandImpl), pid];
+  let delivered = false;
+  for (const targetPid of targets) {
+    delivered = terminateUnixProcessOrGroup(targetPid, killImpl) || delivered;
   }
+  return { attempted: true, delivered, method: "process-tree", targets };
 }
 
 export function formatCommandFailure(result) {

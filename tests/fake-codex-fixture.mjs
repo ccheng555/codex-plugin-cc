@@ -275,6 +275,7 @@ const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 if (BEHAVIOR === "with-helper-child") {
   const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: process.platform !== "win32",
     stdio: "ignore"
   });
   helper.unref();
