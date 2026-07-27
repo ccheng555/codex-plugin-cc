@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir as createTempDir, run } from "./helpers.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
@@ -16,6 +16,35 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const runtimeTempDirs = new Set();
+const runtimePluginDataDir = createTempDir("codex-plugin-runtime-state-");
+process.env.CLAUDE_PLUGIN_DATA = runtimePluginDataDir;
+
+function makeTempDir(prefix) {
+  const tempDir = createTempDir(prefix);
+  runtimeTempDirs.add(tempDir);
+  return tempDir;
+}
+
+test.after(() => {
+  const cleanupFailures = [];
+
+  for (const cwd of [ROOT, ...runtimeTempDirs]) {
+    if (!loadBrokerSession(cwd)) {
+      continue;
+    }
+
+    const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
+      cwd,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd })
+    });
+    if (cleanup.status !== 0 || loadBrokerSession(cwd)) {
+      cleanupFailures.push({ cwd, status: cleanup.status, stderr: cleanup.stderr });
+    }
+  }
+
+  assert.deepEqual(cleanupFailures, []);
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
