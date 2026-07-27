@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", async () => {
   let captured = null;
@@ -296,10 +296,83 @@ test("terminateProcessTree escalates resistant descendants and verifies exit", a
 
   assert.deepEqual(signals, [
     [-1235, "SIGTERM"],
-    [-1234, "SIGTERM"],
     [-1235, "SIGKILL"],
+    [-1234, "SIGTERM"],
     [-1234, "SIGKILL"]
   ]);
   assert.equal(outcome.verified, true);
   assert.equal(outcome.escalated, true);
+});
+
+test("terminateProcessTree keeps the root alive until its descendants are reaped", async () => {
+  const signals = [];
+  const alive = new Set([100, 200]);
+  const outcome = await terminateProcessTree(100, {
+    platform: "darwin",
+    pollIntervalMs: 0,
+    runCommandImpl(command, args) {
+      const rows = [];
+      if (alive.has(100)) {
+        rows.push("100 1 100 S Mon Jul 27 00:00:00 2026");
+      }
+      if (alive.has(200)) {
+        rows.push("200 100 200 S Mon Jul 27 00:00:01 2026");
+      }
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: rows.length ? `${rows.join("\n")}\n` : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+      // The helper resists SIGTERM so the descendant phase must escalate
+      // before the root may be signaled at all.
+      if (Math.abs(pid) === 200 && signal === "SIGTERM") {
+        return;
+      }
+      alive.delete(Math.abs(pid));
+    }
+  });
+
+  assert.deepEqual(signals, [
+    [-200, "SIGTERM"],
+    [-200, "SIGKILL"],
+    [-100, "SIGTERM"]
+  ]);
+  assert.equal(outcome.verified, true);
+  assert.equal(outcome.escalated, true);
+});
+
+test("terminateProcessGroup reclaims orphaned members of a dead leader's group", async () => {
+  const signals = [];
+  const alive = new Set([202]);
+  const outcome = await terminateProcessGroup(200, {
+    platform: "darwin",
+    pollIntervalMs: 0,
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: alive.has(202) ? "202 1 200 S Mon Jul 27 00:00:02 2026\n" : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+      alive.delete(Math.abs(pid));
+    }
+  });
+
+  assert.deepEqual(signals, [[202, "SIGTERM"]]);
+  assert.equal(outcome.verified, true);
+  assert.equal(outcome.method, "process-group");
+  assert.deepEqual(outcome.targets, [202]);
 });

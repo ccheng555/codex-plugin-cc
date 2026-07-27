@@ -8,7 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { getLiveProcessPids } from "./lib/process.mjs";
+import { getLiveProcessPids, terminateProcessGroup } from "./lib/process.mjs";
 
 const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -240,10 +240,32 @@ async function main() {
         .then((client) => {
           appClient = client;
           client.setNotificationHandler(routeNotification);
+          const childPid = client.proc?.pid ?? null;
           client.setExitHandler(() => {
             clearStreamState();
             if (appClient === client) {
               appClient = null;
+            }
+            if (!client.closed && childPid != null && process.platform !== "win32") {
+              // The child is a detached process-group leader; on an unexpected
+              // exit its surviving helpers reparent away from the broker, so
+              // reclaim the group before allowing a replacement to spawn.
+              appClientClosePromise = terminateProcessGroup(childPid)
+                .then((outcome) => {
+                  client.cleanupOutcome = {
+                    verified: outcome.verified ?? false,
+                    survivors: outcome.survivors ?? [],
+                    degraded: outcome.degraded ?? false
+                  };
+                  recordUnverifiedCleanup(client);
+                })
+                .catch((error) => {
+                  blockedCleanup = { degraded: true, survivors: [] };
+                  process.stderr.write(`Warning: shared Codex broker could not reclaim exited app-server group: ${error.message}. No replacement child will be spawned.\n`);
+                })
+                .finally(() => {
+                  appClientClosePromise = null;
+                });
             }
             scheduleChildIdleClose();
           });

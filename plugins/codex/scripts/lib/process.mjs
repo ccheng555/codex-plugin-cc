@@ -267,10 +267,17 @@ function signalVerifiedUnit(unit, signal, processes, killImpl) {
   }
 }
 
+function withoutExcluded(records, excludePids) {
+  if (!excludePids || excludePids.size === 0) {
+    return records;
+  }
+  return records.filter((record) => !excludePids.has(record.pid));
+}
+
 function signalTracked(tracked, signal, options) {
   const processes = readUnixProcessTable(options.runCommandImpl, options);
   mergeTrackedDescendants(tracked, processes, options.rootPid, options.rootIdentity);
-  const units = buildSignalUnits(listLiveTracked(tracked, processes));
+  const units = buildSignalUnits(withoutExcluded(listLiveTracked(tracked, processes), options.excludePids));
   let delivered = false;
   for (const unit of units) {
     delivered = signalVerifiedUnit(unit, signal, processes, options.killImpl) || delivered;
@@ -283,7 +290,7 @@ async function pollTracked(tracked, options, attempts) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const processes = readUnixProcessTable(options.runCommandImpl, options);
     mergeTrackedDescendants(tracked, processes, options.rootPid, options.rootIdentity);
-    live = listLiveTracked(tracked, processes);
+    live = withoutExcluded(listLiveTracked(tracked, processes), options.excludePids);
     if (live.length === 0) {
       break;
     }
@@ -418,31 +425,29 @@ export async function terminateProcessTree(pid, options = {}) {
     pollIntervalMs: options.pollIntervalMs ?? 25
   };
 
-  // Terminate descendants first and wait for them while their parent is still
-  // alive, so the parent can reap them. Killing the whole tree back-to-back
-  // leaves permanent zombies where PID 1 does not reap orphans (containers).
-  const descendants = new Map();
-  const roots = new Map();
-  for (const [identity, record] of tracked) {
-    (record.pid === pid ? roots : descendants).set(identity, record);
-  }
-
   try {
     let delivered = false;
     let escalated = false;
     let live = [];
-    for (const phase of [descendants, roots]) {
-      if (phase.size === 0) {
-        continue;
-      }
-      delivered = signalTracked(phase, "SIGTERM", unixOptions) || delivered;
-      let phaseLive = await pollTracked(phase, unixOptions, options.termPollAttempts ?? 11);
+    // Terminate descendants first and wait for them while their parent is
+    // still alive, so the parent can reap them; killing the whole tree
+    // back-to-back leaves permanent zombies where PID 1 does not reap orphans
+    // (containers). Both phases share the one tracked map so PID-reuse
+    // identity memory carries across phases; the descendant phase only
+    // excludes the root pid from signaling and liveness.
+    const hasDescendants = [...tracked.values()].some((record) => record.pid !== pid);
+    const phases = hasDescendants
+      ? [{ ...unixOptions, excludePids: new Set([pid]) }, unixOptions]
+      : [unixOptions];
+    for (const phaseOptions of phases) {
+      delivered = signalTracked(tracked, "SIGTERM", phaseOptions) || delivered;
+      let phaseLive = await pollTracked(tracked, phaseOptions, options.termPollAttempts ?? 11);
       if (phaseLive.length > 0) {
         escalated = true;
-        delivered = signalTracked(phase, "SIGKILL", unixOptions) || delivered;
-        phaseLive = await pollTracked(phase, unixOptions, options.killPollAttempts ?? 11);
+        delivered = signalTracked(tracked, "SIGKILL", phaseOptions) || delivered;
+        phaseLive = await pollTracked(tracked, phaseOptions, options.killPollAttempts ?? 11);
       }
-      live = live.concat(phaseLive);
+      live = phaseLive;
     }
 
     return {
@@ -461,6 +466,80 @@ export async function terminateProcessTree(pid, options = {}) {
       throw error;
     }
     return degradedDirectChildKill(pid, options, killImpl, error.message);
+  }
+}
+
+export async function terminateProcessGroup(pgid, options = {}) {
+  if (!Number.isFinite(pgid)) {
+    return { attempted: false, delivered: false, verified: true, survivors: [] };
+  }
+  if ((options.platform ?? process.platform) === "win32") {
+    return { attempted: false, delivered: false, verified: true, survivors: [] };
+  }
+
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+
+  let processes;
+  try {
+    processes = readUnixProcessTable(runCommandImpl, options);
+  } catch (error) {
+    if (error?.code !== "PROCESS_TABLE_UNAVAILABLE") {
+      throw error;
+    }
+    warnProcessCleanup(
+      `Unable to enumerate Unix processes while reclaiming process group ${pgid}; surviving PIDs unknown.`,
+      options
+    );
+    return { attempted: false, delivered: false, verified: false, degraded: true, survivors: [] };
+  }
+
+  const tracked = new Map();
+  for (const record of processes.values()) {
+    if (record.processGroupId === pgid && isRunningProcess(record)) {
+      tracked.set(record.identity, record);
+    }
+  }
+  if (tracked.size === 0) {
+    return { attempted: false, delivered: false, verified: true, survivors: [] };
+  }
+
+  const unixOptions = {
+    runCommandImpl,
+    killImpl,
+    cwd: options.cwd,
+    env: options.env,
+    sleepImpl: options.sleepImpl ?? sleep,
+    pollIntervalMs: options.pollIntervalMs ?? 25
+  };
+
+  try {
+    let delivered = signalTracked(tracked, "SIGTERM", unixOptions);
+    let live = await pollTracked(tracked, unixOptions, options.termPollAttempts ?? 11);
+    let escalated = false;
+    if (live.length > 0) {
+      escalated = true;
+      delivered = signalTracked(tracked, "SIGKILL", unixOptions) || delivered;
+      live = await pollTracked(tracked, unixOptions, options.killPollAttempts ?? 11);
+    }
+    return {
+      attempted: true,
+      delivered,
+      verified: live.length === 0,
+      escalated,
+      method: "process-group",
+      targets: [...tracked.values()].map((record) => record.pid),
+      survivors: live.map((record) => record.pid)
+    };
+  } catch (error) {
+    if (error?.code !== "PROCESS_TABLE_UNAVAILABLE") {
+      throw error;
+    }
+    warnProcessCleanup(
+      `Unable to verify Unix process-group cleanup for pgid ${pgid}; surviving PIDs unknown.`,
+      options
+    );
+    return { attempted: true, delivered: true, verified: false, degraded: true, survivors: [] };
   }
 }
 
