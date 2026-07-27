@@ -39,7 +39,7 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
-function cleanupSessionJobs(cwd, sessionId) {
+async function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
   }
@@ -62,7 +62,7 @@ function cleanupSessionJobs(cwd, sessionId) {
       continue;
     }
     try {
-      terminateProcessTree(job.pid ?? Number.NaN);
+      await terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
       // Ignore teardown failures during session shutdown.
     }
@@ -101,8 +101,8 @@ async function handleSessionEnd(input) {
     await sendBrokerShutdown(brokerEndpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  teardownBrokerSession({
+  await cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  await teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
     logFile,

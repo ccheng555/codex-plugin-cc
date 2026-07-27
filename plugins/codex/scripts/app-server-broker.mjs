@@ -178,7 +178,10 @@ async function main() {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
-      clearStreamState();
+      // Detach only the notification socket. The turn may still be running in
+      // the app-server; stream state is cleared on turn/completed, on a
+      // streaming request error, on child exit, or when the child is released.
+      activeStreamSocket = null;
     }
   }
 

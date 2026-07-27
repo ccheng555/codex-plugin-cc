@@ -117,7 +117,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
   }
 
   if (existing) {
-    teardownBrokerSession({
+    await teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
       logFile: existing.logFile ?? null,
@@ -148,7 +148,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
-    teardownBrokerSession({
+    await teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
@@ -170,10 +170,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
+export async function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
   if (Number.isFinite(pid) && killProcess) {
     try {
-      killProcess(pid);
+      await killProcess(pid);
     } catch {
       // Ignore missing or already-exited broker processes.
     }

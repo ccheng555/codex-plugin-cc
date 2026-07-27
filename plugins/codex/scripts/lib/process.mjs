@@ -418,14 +418,31 @@ export async function terminateProcessTree(pid, options = {}) {
     pollIntervalMs: options.pollIntervalMs ?? 25
   };
 
+  // Terminate descendants first and wait for them while their parent is still
+  // alive, so the parent can reap them. Killing the whole tree back-to-back
+  // leaves permanent zombies where PID 1 does not reap orphans (containers).
+  const descendants = new Map();
+  const roots = new Map();
+  for (const [identity, record] of tracked) {
+    (record.pid === pid ? roots : descendants).set(identity, record);
+  }
+
   try {
-    let delivered = signalTracked(tracked, "SIGTERM", unixOptions);
-    let live = await pollTracked(tracked, unixOptions, options.termPollAttempts ?? 11);
+    let delivered = false;
     let escalated = false;
-    if (live.length > 0) {
-      escalated = true;
-      delivered = signalTracked(tracked, "SIGKILL", unixOptions) || delivered;
-      live = await pollTracked(tracked, unixOptions, options.killPollAttempts ?? 11);
+    let live = [];
+    for (const phase of [descendants, roots]) {
+      if (phase.size === 0) {
+        continue;
+      }
+      delivered = signalTracked(phase, "SIGTERM", unixOptions) || delivered;
+      let phaseLive = await pollTracked(phase, unixOptions, options.termPollAttempts ?? 11);
+      if (phaseLive.length > 0) {
+        escalated = true;
+        delivered = signalTracked(phase, "SIGKILL", unixOptions) || delivered;
+        phaseLive = await pollTracked(phase, unixOptions, options.killPollAttempts ?? 11);
+      }
+      live = live.concat(phaseLive);
     }
 
     return {
