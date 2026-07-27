@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir as createTempDir, run } from "./helpers.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { ensureBrokerSession, loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -91,6 +91,32 @@ function installSlowRejectFakeCodex(binDir) {
       ),
     "utf8"
   );
+}
+
+function installInitializeErrorFakeCodex(binDir) {
+  installFakeCodex(binDir, "initialize-rpc-error");
+  const scriptPath = path.join(binDir, "codex");
+  let source = fs.readFileSync(scriptPath, "utf8");
+  const startsMarker = "bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;";
+  assert.ok(source.includes(startsMarker));
+  source = source.replace(
+    startsMarker,
+    `${startsMarker}
+bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];`
+  );
+  const initializeMarker = `      case "initialize":
+        state.capabilities = message.params.capabilities || null;`;
+  assert.ok(source.includes(initializeMarker));
+  source = source.replace(
+    initializeMarker,
+    `      case "initialize":
+        if (BEHAVIOR === "initialize-rpc-error") {
+          send({ id: message.id, error: { code: -32010, message: "initialize failed" } });
+          break;
+        }
+        state.capabilities = message.params.capabilities || null;`
+  );
+  fs.writeFileSync(scriptPath, source, "utf8");
 }
 
 function instrumentSlowFakeTurnState(binDir) {
@@ -2305,6 +2331,78 @@ test("shared broker clears a disconnected stream after its request rejects", asy
     }
   }, { timeoutMs: 1500, intervalMs: 20 });
   assert.ok(Array.isArray(response.data));
+});
+
+test("shared broker cleans up an app-server whose initialization returns an RPC error", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installInitializeErrorFakeCodex(binDir);
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "100"
+  };
+  const brokerSession = await ensureBrokerSession(repo, { env });
+  t.after(() => {
+    if (brokerSession) {
+      run("node", [SESSION_HOOK, "SessionEnd"], {
+        cwd: repo,
+        env,
+        input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+      });
+    }
+    if (fs.existsSync(fakeStatePath)) {
+      const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+      for (const pid of state.appServerPids || []) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Ignore children already terminated by the cleanup path.
+        }
+      }
+    }
+  });
+
+  async function requestUntilInitializationFails() {
+    const request = brokerSession
+      ? (() => {
+          const client = CodexAppServerClient.connect(repo, { env });
+          return client.then((connectedClient) => connectedClient.request("thread/list", { cwd: repo }));
+        })()
+      : CodexAppServerClient.connect(repo, { env, disableBroker: true });
+    await assert.rejects(
+      request,
+      (error) =>
+        (error.rpcCode === -32010 && /initialize failed/.test(error.message)) ||
+        (error.rpcCode === -32002 && /refusing to spawn a replacement child/i.test(error.message))
+    );
+  }
+
+  function loadFakeState() {
+    return JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  }
+
+  function isLive(pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code !== "ESRCH";
+    }
+  }
+
+  await requestUntilInitializationFails();
+  await waitFor(() => {
+    const state = loadFakeState();
+    return state.appServerStarts === 1 && state.appServerPids?.length === 1 && !isLive(state.appServerPids[0]);
+  });
+
+  await requestUntilInitializationFails();
+  await waitFor(() => {
+    const state = loadFakeState();
+    return state.appServerStarts <= 2 && state.appServerPids?.length <= 2 && state.appServerPids.every((pid) => !isLive(pid));
+  });
 });
 
 test("shared broker releases its idle app-server child and restarts it on demand", async (t) => {

@@ -395,7 +395,23 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
+    try {
+      await client.initialize();
+      return client;
+    } catch (error) {
+      try {
+        await client.close();
+      } catch {
+        client.cleanupOutcome = {
+          verified: false,
+          survivors: [],
+          degraded: true
+        };
+      }
+      if (client.cleanupOutcome?.verified === false) {
+        error.cleanupOutcome = client.cleanupOutcome;
+      }
+      throw error;
+    }
   }
 }

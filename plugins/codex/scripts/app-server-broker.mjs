@@ -271,6 +271,12 @@ async function main() {
           });
           return client;
         })
+        .catch((error) => {
+          if (error.cleanupOutcome) {
+            recordUnverifiedCleanup({ cleanupOutcome: error.cleanupOutcome });
+          }
+          throw error;
+        })
         .finally(() => {
           appClientStartPromise = null;
         });
