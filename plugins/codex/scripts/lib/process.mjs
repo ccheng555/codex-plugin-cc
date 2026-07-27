@@ -246,6 +246,28 @@ function buildSignalUnits(records) {
   return units;
 }
 
+function mergeTrackedGroupMembers(tracked, processes, units) {
+  const trackedByPid = new Map([...tracked.values()].map((record) => [record.pid, record.identity]));
+  for (const unit of units) {
+    if (!unit.group) {
+      continue;
+    }
+    for (const record of processes.values()) {
+      if (record.processGroupId !== unit.record.processGroupId) {
+        continue;
+      }
+      const priorIdentity = trackedByPid.get(record.pid);
+      if (priorIdentity && priorIdentity !== record.identity) {
+        continue;
+      }
+      if (!tracked.has(record.identity)) {
+        tracked.set(record.identity, { ...record, depth: unit.record.depth + 1 });
+        trackedByPid.set(record.pid, record.identity);
+      }
+    }
+  }
+}
+
 function signalVerifiedUnit(unit, signal, processes, killImpl) {
   const current = processes.get(unit.record.pid);
   if (current?.identity !== unit.record.identity || !isRunningProcess(current)) {
@@ -277,6 +299,7 @@ function withoutExcluded(records, excludePids) {
 function signalTracked(tracked, signal, options) {
   const processes = readUnixProcessTable(options.runCommandImpl, options);
   mergeTrackedDescendants(tracked, processes, options.rootPid, options.rootIdentity);
+  mergeTrackedGroupMembers(tracked, processes, buildSignalUnits(listLiveTracked(tracked, processes)));
   const units = buildSignalUnits(withoutExcluded(listLiveTracked(tracked, processes), options.excludePids));
   let delivered = false;
   for (const unit of units) {

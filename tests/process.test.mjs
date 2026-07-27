@@ -348,6 +348,53 @@ test("terminateProcessTree keeps the root alive until its descendants are reaped
   assert.equal(outcome.escalated, true);
 });
 
+test("terminateProcessTree tracks reparented members of a signaled process group", async () => {
+  async function runScenario(helperSurvivesKill) {
+    const signals = [];
+    const alive = new Set([100, 200]);
+    const outcome = await terminateProcessTree(100, {
+      platform: "darwin",
+      termPollAttempts: 1,
+      killPollAttempts: 1,
+      sleepImpl() {},
+      runCommandImpl(command, args) {
+        const rows = [];
+        if (alive.has(100)) {
+          rows.push("100 1 100 S Mon Jul 27 00:00:00 2026");
+        }
+        if (alive.has(200)) {
+          rows.push("200 1 100 S Mon Jul 27 00:00:01 2026");
+        }
+        return {
+          command,
+          args,
+          status: 0,
+          signal: null,
+          stdout: rows.length ? `${rows.join("\n")}\n` : "",
+          stderr: "",
+          error: null
+        };
+      },
+      killImpl(pid, signal) {
+        signals.push([pid, signal]);
+        if (signal === "SIGTERM") {
+          alive.delete(100);
+        } else if (!helperSurvivesKill) {
+          alive.delete(200);
+        }
+      }
+    });
+
+    assert.deepEqual(signals, [[-100, "SIGTERM"], [200, "SIGKILL"]]);
+    assert.equal(outcome.escalated, true);
+    assert.equal(outcome.verified, !helperSurvivesKill);
+    assert.deepEqual(outcome.survivors, helperSurvivesKill ? [200] : []);
+  }
+
+  await runScenario(false);
+  await runScenario(true);
+});
+
 test("terminateProcessGroup reclaims orphaned members of a dead leader's group", async () => {
   const signals = [];
   const alive = new Set([202]);
