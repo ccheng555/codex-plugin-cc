@@ -85,6 +85,7 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeStreamRunning = false;
   const sockets = new Set();
 
   function cancelChildIdleClose() {
@@ -99,7 +100,7 @@ async function main() {
       sockets.size > 0 ||
       inFlightRequests > 0 ||
       activeRequestSocket !== null ||
-      activeStreamSocket !== null
+      activeStreamRunning
     );
   }
 
@@ -144,24 +145,25 @@ async function main() {
     }
     if (activeStreamSocket === socket) {
       activeStreamSocket = null;
-      activeStreamThreadIds = null;
     }
   }
 
   function routeNotification(message) {
     const target = activeRequestSocket ?? activeStreamSocket;
-    if (!target) {
-      return;
+    if (target) {
+      send(target, message);
     }
-    send(target, message);
-    if (message.method === "turn/completed" && activeStreamSocket === target) {
+    if (message.method === "turn/completed" && activeStreamRunning) {
       const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
+        const streamSocket = activeStreamSocket;
+        activeStreamRunning = false;
         activeStreamSocket = null;
         activeStreamThreadIds = null;
-        if (activeRequestSocket === target) {
+        if (activeRequestSocket === streamSocket) {
           activeRequestSocket = null;
         }
+        scheduleChildIdleClose();
       }
     }
   }
@@ -263,10 +265,11 @@ async function main() {
         }
 
         const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+          isInterruptRequest(message) && activeStreamRunning && activeStreamSocket !== socket && !activeRequestSocket;
 
         if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
+          ((activeRequestSocket && activeRequestSocket !== socket) ||
+            (activeStreamRunning && activeStreamSocket !== socket)) &&
           !allowInterruptDuringActiveStream
         ) {
           send(socket, {
@@ -296,14 +299,18 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        if (isStreaming) {
+          activeStreamRunning = true;
+          activeStreamSocket = socket;
+          activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, null);
+        }
         inFlightRequests += 1;
 
         try {
           const client = await getAppClient();
           const result = await client.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
-            activeStreamSocket = socket;
+          if (isStreaming && activeStreamRunning && activeStreamSocket === socket) {
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
           if (activeRequestSocket === socket) {
@@ -317,8 +324,10 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
+          if (isStreaming && activeStreamSocket === socket) {
+            activeStreamRunning = false;
             activeStreamSocket = null;
+            activeStreamThreadIds = null;
           }
         } finally {
           inFlightRequests -= 1;

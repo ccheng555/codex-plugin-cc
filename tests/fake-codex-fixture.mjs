@@ -273,7 +273,7 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
-if (BEHAVIOR === "with-helper-child") {
+if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-child") {
   const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     detached: process.platform !== "win32",
     stdio: "ignore"
@@ -609,7 +609,7 @@ rl.on("line", (line) => {
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          }, 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
-	        } else if (BEHAVIOR === "slow-task") {
+	        } else if (BEHAVIOR === "slow-task" || BEHAVIOR === "slow-task-with-helper-child") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);

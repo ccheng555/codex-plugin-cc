@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { terminateProcessTree } from "./process.mjs";
+import { getProcessIdentity, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -195,7 +195,6 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
     });
-
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
 
@@ -227,6 +226,30 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });
+    try {
+      this.procIdentity =
+        process.platform === "win32"
+          ? null
+          : getProcessIdentity(this.proc.pid, {
+              cwd: this.cwd,
+              env: this.options.env ?? process.env
+            });
+    } catch (error) {
+      try {
+        process.kill(-this.proc.pid, "SIGKILL");
+      } catch {
+        // The child may have exited before identity capture completed.
+      }
+      throw error;
+    }
+    if (process.platform !== "win32" && !this.procIdentity) {
+      try {
+        process.kill(-this.proc.pid, "SIGKILL");
+      } catch {
+        // The child may have exited before identity capture completed.
+      }
+      throw new Error("Unable to capture codex app-server process identity.");
+    }
     this.notify("initialized", {});
   }
 
@@ -258,7 +281,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       } else {
         // The app-server is its own process-group leader on Unix. Terminate
         // the group so MCP helpers cannot outlive the app-server parent.
-        terminateProcessTree(this.proc.pid);
+        const outcome = terminateProcessTree(this.proc.pid, {
+          expectedRootIdentity: this.procIdentity
+        });
+        if (!outcome.verified) {
+          throw new Error(`Unable to verify codex app-server cleanup; surviving PIDs: ${outcome.survivors.join(", ")}.`);
+        }
       }
     }
 

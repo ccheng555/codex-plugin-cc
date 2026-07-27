@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -2231,6 +2232,54 @@ test("shared broker releases its idle app-server child and restarts it on demand
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 2);
   assert.equal(fakeState.helperPids.length, 2);
+});
+
+test("shared broker keeps active work alive after its client disconnects", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installFakeCodex(binDir, "slow-task-with-helper-child");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "100"
+  };
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+  });
+
+  const client = await CodexAppServerClient.connect(repo, { env });
+  const started = await client.request("thread/start", { cwd: repo, ephemeral: true });
+  await client.request("turn/start", {
+    threadId: started.thread.id,
+    input: [{ type: "text", text: "finish after the client disconnects" }]
+  });
+  await client.close();
+
+  const initialState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const helperPid = initialState.helperPids?.[0];
+  assert.ok(helperPid);
+
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.doesNotThrow(() => process.kill(helperPid, 0));
+
+  await waitFor(() => {
+    try {
+      process.kill(helperPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
 });
 
 test("setup reuses an existing shared app-server without starting another one", () => {
