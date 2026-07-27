@@ -2161,6 +2161,56 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("shared broker releases its idle app-server child and restarts it on demand", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "100"
+  };
+
+  const review = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(review.status, 0, review.stderr);
+
+  const firstSession = loadBrokerSession(repo);
+  assert.ok(firstSession?.pid);
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({
+        hook_event_name: "SessionEnd",
+        cwd: repo
+      })
+    });
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const adversarial = run("node", [SCRIPT, "adversarial-review"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+
+  const secondSession = loadBrokerSession(repo);
+  assert.equal(secondSession?.pid, firstSession.pid);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.appServerStarts, 2);
+});
+
 test("setup reuses an existing shared app-server without starting another one", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

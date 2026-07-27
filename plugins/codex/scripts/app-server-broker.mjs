@@ -9,7 +9,17 @@ import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
+const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+
+function resolveChildIdleMs(env = process.env) {
+  const raw = env.CODEX_COMPANION_BROKER_CHILD_IDLE_MS;
+  if (raw == null || raw === "") {
+    return DEFAULT_CHILD_IDLE_MS;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_CHILD_IDLE_MS;
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -65,11 +75,68 @@ async function main() {
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
   writePidFile(pidFile);
 
-  const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  const childIdleMs = resolveChildIdleMs();
+  let appClient = null;
+  let appClientStartPromise = null;
+  let appClientClosePromise = null;
+  let childIdleTimer = null;
+  let inFlightRequests = 0;
+  let shutdownPromise = null;
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+
+  function cancelChildIdleClose() {
+    if (childIdleTimer) {
+      clearTimeout(childIdleTimer);
+      childIdleTimer = null;
+    }
+  }
+
+  function hasActiveWork() {
+    return (
+      sockets.size > 0 ||
+      inFlightRequests > 0 ||
+      activeRequestSocket !== null ||
+      activeStreamSocket !== null
+    );
+  }
+
+  async function closeAppClient() {
+    cancelChildIdleClose();
+    if (appClientStartPromise) {
+      await appClientStartPromise.catch(() => {});
+    }
+    if (appClientClosePromise) {
+      await appClientClosePromise;
+      return;
+    }
+    const client = appClient;
+    appClient = null;
+    if (!client) {
+      return;
+    }
+    appClientClosePromise = client.close().catch(() => {}).finally(() => {
+      appClientClosePromise = null;
+    });
+    await appClientClosePromise;
+  }
+
+  function scheduleChildIdleClose() {
+    cancelChildIdleClose();
+    if (!appClient || hasActiveWork()) {
+      return;
+    }
+    childIdleTimer = setTimeout(() => {
+      childIdleTimer = null;
+      if (hasActiveWork()) {
+        return;
+      }
+      void closeAppClient();
+    }, childIdleMs);
+    childIdleTimer.unref?.();
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -99,23 +166,51 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  async function getAppClient() {
+    cancelChildIdleClose();
+    if (appClient) {
+      return appClient;
     }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    if (appClientClosePromise) {
+      await appClientClosePromise;
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    if (!appClientStartPromise) {
+      appClientStartPromise = CodexAppServerClient.connect(cwd, { disableBroker: true })
+        .then((client) => {
+          appClient = client;
+          client.setNotificationHandler(routeNotification);
+          return client;
+        })
+        .finally(() => {
+          appClientStartPromise = null;
+        });
     }
+    return appClientStartPromise;
   }
 
-  appClient.setNotificationHandler(routeNotification);
+  async function shutdown(server) {
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
+    shutdownPromise = (async () => {
+      cancelChildIdleClose();
+      for (const socket of sockets) {
+        socket.end();
+      }
+      await closeAppClient();
+      await new Promise((resolve) => server.close(resolve));
+      if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
+        fs.unlinkSync(listenTarget.path);
+      }
+      if (pidFile && fs.existsSync(pidFile)) {
+        fs.unlinkSync(pidFile);
+      }
+    })();
+    return shutdownPromise;
+  }
 
   const server = net.createServer((socket) => {
+    cancelChildIdleClose();
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -182,23 +277,30 @@ async function main() {
         }
 
         if (allowInterruptDuringActiveStream) {
+          inFlightRequests += 1;
           try {
-            const result = await appClient.request(message.method, message.params ?? {});
+            const client = await getAppClient();
+            const result = await client.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
           } catch (error) {
             send(socket, {
               id: message.id,
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
+          } finally {
+            inFlightRequests -= 1;
+            scheduleChildIdleClose();
           }
           continue;
         }
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        inFlightRequests += 1;
 
         try {
-          const result = await appClient.request(message.method, message.params ?? {});
+          const client = await getAppClient();
+          const result = await client.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
             activeStreamSocket = socket;
@@ -218,6 +320,9 @@ async function main() {
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
           }
+        } finally {
+          inFlightRequests -= 1;
+          scheduleChildIdleClose();
         }
       }
     });
@@ -225,11 +330,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      scheduleChildIdleClose();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      scheduleChildIdleClose();
     });
   });
 
