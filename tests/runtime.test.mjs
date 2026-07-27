@@ -58,6 +58,64 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function installSlowRejectFakeCodex(binDir) {
+  installFakeCodex(binDir, "slow-reject");
+  const scriptPath = path.join(binDir, "codex");
+  const marker = "const turnId = nextTurnId(state);";
+  const source = fs.readFileSync(scriptPath, "utf8");
+  // The marker also appears in the review/start handler; anchor the patch to
+  // the turn/start case so the injection lands in the right handler.
+  const caseStart = source.indexOf('case "turn/start"');
+  assert.ok(caseStart !== -1);
+  const markerAt = source.indexOf(marker, caseStart);
+  assert.ok(markerAt !== -1);
+  fs.writeFileSync(
+    scriptPath,
+    source.slice(0, markerAt) +
+      source.slice(markerAt).replace(
+        marker,
+      `if (BEHAVIOR === "slow-reject") {
+          state.turnRejectPending = true;
+          saveState(state);
+          setTimeout(() => {
+            const current = loadState();
+            send({ id: message.id, error: { code: -32000, message: "slow fake turn rejected" } });
+            current.turnRejectPending = false;
+            current.turnRejectSent = true;
+            saveState(current);
+          }, 400);
+          break;
+        }
+
+        ${marker}`
+      ),
+    "utf8"
+  );
+}
+
+function instrumentSlowFakeTurnState(binDir) {
+  const scriptPath = path.join(binDir, "codex");
+  const source = fs.readFileSync(scriptPath, "utf8");
+  const delayedTurn = "emitTurnCompletedLater(thread.id, turnId, items, 400);";
+  assert.ok(source.includes(delayedTurn));
+  fs.writeFileSync(
+    scriptPath,
+    source.replace(
+      delayedTurn,
+      `state.turnInFlight = true;
+          saveState(state);
+          ${delayedTurn}`
+    ).replace(
+      "emitTurnCompleted(threadId, turnId, item);",
+      `emitTurnCompleted(threadId, turnId, item);
+    const currentState = loadState();
+    currentState.turnInFlight = false;
+    saveState(currentState);`
+    ),
+    "utf8"
+  );
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -2191,6 +2249,64 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("shared broker clears a disconnected stream after its request rejects", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installSlowRejectFakeCodex(binDir);
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "1000"
+  };
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+  });
+
+  const clientA = await CodexAppServerClient.connect(repo, { env });
+  const started = await clientA.request("thread/start", { cwd: repo, ephemeral: true });
+  const pendingTurn = clientA
+    .request("turn/start", {
+      threadId: started.thread.id,
+      input: [{ type: "text", text: "reject this turn after the client disconnects" }]
+    })
+    .catch(() => null);
+
+  await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) {
+      return false;
+    }
+    return JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).turnRejectPending === true;
+  });
+  await clientA.close();
+  await pendingTurn;
+
+  await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) {
+      return false;
+    }
+    return JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).turnRejectSent === true;
+  });
+
+  const clientB = await CodexAppServerClient.connect(repo, { env });
+  t.after(() => clientB.close().catch(() => {}));
+  const response = await waitFor(async () => {
+    try {
+      return await clientB.request("thread/list", { cwd: repo });
+    } catch (error) {
+      if (error.rpcCode === -32001) {
+        return false;
+      }
+      throw error;
+    }
+  }, { timeoutMs: 1500, intervalMs: 20 });
+  assert.ok(Array.isArray(response.data));
+});
+
 test("shared broker releases its idle app-server child and restarts it on demand", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2240,7 +2356,6 @@ test("shared broker releases its idle app-server child and restarts it on demand
   const firstFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   const firstHelperPid = firstFakeState.helperPids?.[0];
   assert.ok(firstHelperPid);
-  await new Promise((resolve) => setTimeout(resolve, 300));
   await waitFor(() => {
     try {
       process.kill(firstHelperPid, 0);
@@ -2269,6 +2384,7 @@ test("shared broker keeps active work alive after its client disconnects", async
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
 
   installFakeCodex(binDir, "slow-task-with-helper-child");
+  instrumentSlowFakeTurnState(binDir);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -2298,8 +2414,17 @@ test("shared broker keeps active work alive after its client disconnects", async
   const helperPid = initialState.helperPids?.[0];
   assert.ok(helperPid);
 
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assert.doesNotThrow(() => process.kill(helperPid, 0));
+  await waitFor(() => {
+    if (JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).turnInFlight !== true) {
+      return false;
+    }
+    try {
+      process.kill(helperPid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 
   await waitFor(() => {
     try {

@@ -63,6 +63,7 @@ class AppServerClientBase {
     this.stderr = "";
     this.closed = false;
     this.exitError = null;
+    this.exitHandler = null;
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
     this.lineBuffer = "";
@@ -75,6 +76,10 @@ class AppServerClientBase {
 
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
+  }
+
+  setExitHandler(handler) {
+    this.exitHandler = handler;
   }
 
   /**
@@ -173,6 +178,7 @@ class AppServerClientBase {
     }
     this.pending.clear();
     this.resolveExit(undefined);
+    this.exitHandler?.(this.exitError);
   }
 
   sendMessage(_message) {
@@ -236,7 +242,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
             });
     } catch (error) {
       try {
-        process.kill(-this.proc.pid, "SIGKILL");
+        this.proc.kill("SIGKILL");
       } catch {
         // The child may have exited before identity capture completed.
       }
@@ -244,7 +250,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
     if (process.platform !== "win32" && !this.procIdentity) {
       try {
-        process.kill(-this.proc.pid, "SIGKILL");
+        this.proc.kill("SIGKILL");
       } catch {
         // The child may have exited before identity capture completed.
       }
@@ -270,22 +276,35 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       if (process.platform === "win32") {
         setTimeout(() => {
           if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-            try {
-              terminateProcessTree(this.proc.pid);
-            } catch {
-              // Best-effort cleanup inside an unref'd timer — swallow errors
-              // to avoid crashing the host process during shutdown.
-            }
+            void terminateProcessTree(this.proc.pid)
+              .then((outcome) => {
+                this.cleanupOutcome = {
+                  verified: outcome.verified ?? null,
+                  survivors: outcome.survivors ?? []
+                };
+              })
+              .catch(() => {
+                // Best-effort cleanup inside an unref'd timer — swallow errors
+                // to avoid crashing the host process during shutdown.
+              });
           }
         }, 50).unref?.();
       } else {
         // The app-server is its own process-group leader on Unix. Terminate
         // the group so MCP helpers cannot outlive the app-server parent.
-        const outcome = terminateProcessTree(this.proc.pid, {
-          expectedRootIdentity: this.procIdentity
+        const outcome = await terminateProcessTree(this.proc.pid, {
+          expectedRootIdentity: this.procIdentity,
+          directKillImpl: (signal) => this.proc.kill(signal),
+          warnImpl: () => {}
         });
+        this.cleanupOutcome = {
+          verified: outcome.verified ?? false,
+          survivors: outcome.survivors ?? []
+        };
         if (!outcome.verified) {
-          throw new Error(`Unable to verify codex app-server cleanup; surviving PIDs: ${outcome.survivors.join(", ")}.`);
+          process.stderr.write(
+            `Warning: unable to verify codex app-server cleanup; surviving PIDs: ${outcome.survivors?.join(", ") || "none known"}.\n`
+          );
         }
       }
     }

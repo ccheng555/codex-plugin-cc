@@ -56,28 +56,48 @@ function looksLikeMissingProcessMessage(text) {
 
 const UNIX_PROCESS_TABLE_ARGS = ["-axo", "pid=,ppid=,pgid=,stat=,lstart="];
 const UNIX_PS_COMMAND = "/bin/ps";
+const UNIX_PS_PATH_COMMAND = "ps";
+
+function createProcessTableError(message) {
+  const error = new Error(message);
+  error.code = "PROCESS_TABLE_UNAVAILABLE";
+  return error;
+}
 
 function readUnixProcessTable(runCommandImpl, options = {}) {
-  const result = runCommandImpl(UNIX_PS_COMMAND, UNIX_PROCESS_TABLE_ARGS, {
+  let result = runCommandImpl(UNIX_PS_COMMAND, UNIX_PROCESS_TABLE_ARGS, {
     cwd: options.cwd,
     env: options.env
   });
+  if (result.error?.code === "ENOENT") {
+    result = runCommandImpl(UNIX_PS_PATH_COMMAND, UNIX_PROCESS_TABLE_ARGS, {
+      cwd: options.cwd,
+      env: options.env
+    });
+  }
   if (result.error || result.status !== 0) {
-    const detail = result.error?.message ?? result.stderr.trim() ?? result.stdout.trim() ?? `exit ${result.status}`;
-    throw new Error(`Unable to enumerate Unix processes: ${detail || `exit ${result.status}`}`);
+    const detail = result.error?.message || result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`;
+    throw createProcessTableError(`Unable to enumerate Unix processes: ${detail || `exit ${result.status}`}`);
   }
 
   const processes = new Map();
   for (const line of result.stdout.split("\n")) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
-    if (!match) {
+    const trimmedLine = line.trim();
+    if (!trimmedLine) {
       continue;
+    }
+    const match = trimmedLine.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+    if (!match) {
+      throw createProcessTableError(`Unable to parse Unix process table line: ${trimmedLine}`);
     }
     const pid = Number(match[1]);
     const parentPid = Number(match[2]);
     const processGroupId = Number(match[3]);
     const state = match[4];
     const startedAt = match[5].trim();
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(parentPid) || !Number.isSafeInteger(processGroupId) || !startedAt) {
+      throw createProcessTableError(`Unable to parse Unix process table line: ${trimmedLine}`);
+    }
     processes.set(pid, {
       pid,
       parentPid,
@@ -122,11 +142,11 @@ function collectProcessTree(rootPid, processes, rootDepth = 0) {
   return records;
 }
 
-function sleepSync(milliseconds) {
+function sleep(milliseconds) {
   if (milliseconds <= 0) {
-    return;
+    return Promise.resolve();
   }
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 export function getProcessIdentity(pid, options = {}) {
@@ -134,6 +154,32 @@ export function getProcessIdentity(pid, options = {}) {
     return null;
   }
   return readUnixProcessTable(options.runCommandImpl ?? runCommand, options).get(pid)?.identity ?? null;
+}
+
+export function getLiveProcessPids(pids, options = {}) {
+  const candidates = [...new Set(pids.filter((pid) => Number.isFinite(pid)))];
+  if (candidates.length === 0) {
+    return [];
+  }
+  if ((options.platform ?? process.platform) === "win32") {
+    const killImpl = options.killImpl ?? process.kill.bind(process);
+    return candidates.filter((pid) => {
+      try {
+        killImpl(pid, 0);
+        return true;
+      } catch (error) {
+        return error?.code !== "ESRCH";
+      }
+    });
+  }
+
+  try {
+    const processes = readUnixProcessTable(options.runCommandImpl ?? runCommand, options);
+    return candidates.filter((pid) => isRunningProcess(processes.get(pid)));
+  } catch {
+    // An unverified cleanup remains blocked when liveness cannot be checked.
+    return candidates;
+  }
 }
 
 function mergeTrackedDescendants(tracked, processes, rootPid, rootIdentity) {
@@ -200,8 +246,7 @@ function buildSignalUnits(records) {
   return units;
 }
 
-function signalVerifiedUnit(unit, signal, { runCommandImpl, killImpl, cwd, env }) {
-  const processes = readUnixProcessTable(runCommandImpl, { cwd, env });
+function signalVerifiedUnit(unit, signal, processes, killImpl) {
   const current = processes.get(unit.record.pid);
   if (current?.identity !== unit.record.identity || !isRunningProcess(current)) {
     return false;
@@ -228,12 +273,12 @@ function signalTracked(tracked, signal, options) {
   const units = buildSignalUnits(listLiveTracked(tracked, processes));
   let delivered = false;
   for (const unit of units) {
-    delivered = signalVerifiedUnit(unit, signal, options) || delivered;
+    delivered = signalVerifiedUnit(unit, signal, processes, options.killImpl) || delivered;
   }
   return delivered;
 }
 
-function pollTracked(tracked, options, attempts) {
+async function pollTracked(tracked, options, attempts) {
   let live = [];
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const processes = readUnixProcessTable(options.runCommandImpl, options);
@@ -243,13 +288,46 @@ function pollTracked(tracked, options, attempts) {
       break;
     }
     if (attempt + 1 < attempts) {
-      options.sleepImpl(options.pollIntervalMs);
+      await options.sleepImpl(options.pollIntervalMs);
     }
   }
   return live;
 }
 
-export function terminateProcessTree(pid, options = {}) {
+function warnProcessCleanup(message, options) {
+  const warnImpl = options.warnImpl ?? ((warning) => process.stderr.write(`${warning}\n`));
+  try {
+    warnImpl(message);
+  } catch {
+    // Cleanup warnings must not turn a best-effort kill into a host failure.
+  }
+}
+
+function degradedDirectChildKill(pid, options, killImpl, reason) {
+  const directKillImpl = options.directKillImpl ?? ((signal) => killImpl(pid, signal));
+  let delivered = false;
+  try {
+    delivered = directKillImpl("SIGKILL") !== false;
+  } catch {
+    // The direct child may already have exited.
+  }
+  warnProcessCleanup(
+    `Unable to verify Unix process cleanup for PID ${pid}; used direct-child kill fallback (${String(reason).replace(/\s+/g, " ").trim()}). Surviving PIDs: none known.`,
+    options
+  );
+  return {
+    attempted: true,
+    delivered,
+    verified: false,
+    escalated: false,
+    degraded: true,
+    method: "direct-child",
+    targets: [pid],
+    survivors: []
+  };
+}
+
+export async function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
   }
@@ -292,7 +370,15 @@ export function terminateProcessTree(pid, options = {}) {
     throw new Error(formatCommandFailure(result));
   }
 
-  const initialProcesses = readUnixProcessTable(runCommandImpl, options);
+  let initialProcesses;
+  try {
+    initialProcesses = readUnixProcessTable(runCommandImpl, options);
+  } catch (error) {
+    if (error?.code !== "PROCESS_TABLE_UNAVAILABLE") {
+      throw error;
+    }
+    return degradedDirectChildKill(pid, options, killImpl, error.message);
+  }
   const root = initialProcesses.get(pid);
   const expectedRootIdentity = options.expectedRootIdentity ?? root?.identity ?? null;
   if (!root) {
@@ -328,28 +414,37 @@ export function terminateProcessTree(pid, options = {}) {
     killImpl,
     cwd: options.cwd,
     env: options.env,
-    sleepImpl: options.sleepImpl ?? sleepSync,
+    sleepImpl: options.sleepImpl ?? sleep,
     pollIntervalMs: options.pollIntervalMs ?? 25
   };
 
-  let delivered = signalTracked(tracked, "SIGTERM", unixOptions);
-  let live = pollTracked(tracked, unixOptions, options.termPollAttempts ?? 11);
-  let escalated = false;
-  if (live.length > 0) {
-    escalated = true;
-    delivered = signalTracked(tracked, "SIGKILL", unixOptions) || delivered;
-    live = pollTracked(tracked, unixOptions, options.killPollAttempts ?? 11);
-  }
+  try {
+    let delivered = signalTracked(tracked, "SIGTERM", unixOptions);
+    let live = await pollTracked(tracked, unixOptions, options.termPollAttempts ?? 11);
+    let escalated = false;
+    if (live.length > 0) {
+      escalated = true;
+      delivered = signalTracked(tracked, "SIGKILL", unixOptions) || delivered;
+      live = await pollTracked(tracked, unixOptions, options.killPollAttempts ?? 11);
+    }
 
-  return {
-    attempted: true,
-    delivered,
-    verified: live.length === 0,
-    escalated,
-    method: "process-tree",
-    targets: [...tracked.values()].sort((left, right) => right.depth - left.depth).map((record) => record.pid),
-    survivors: live.map((record) => record.pid)
-  };
+    return {
+      attempted: true,
+      delivered,
+      verified: live.length === 0,
+      escalated,
+      method: "process-tree",
+      // The algorithm covers same-process-group descendants plus those observed at scan time.
+      // A post-scan setsid descendant can escape the tracked process tree.
+      targets: [...tracked.values()].sort((left, right) => right.depth - left.depth).map((record) => record.pid),
+      survivors: live.map((record) => record.pid)
+    };
+  } catch (error) {
+    if (error?.code !== "PROCESS_TABLE_UNAVAILABLE") {
+      throw error;
+    }
+    return degradedDirectChildKill(pid, options, killImpl, error.message);
+  }
 }
 
 export function formatCommandFailure(result) {

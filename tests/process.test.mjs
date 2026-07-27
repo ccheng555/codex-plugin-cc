@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 
 import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
-test("terminateProcessTree uses taskkill on Windows", () => {
+test("terminateProcessTree uses taskkill on Windows", async () => {
   let captured = null;
-  const outcome = terminateProcessTree(1234, {
+  const outcome = await terminateProcessTree(1234, {
     platform: "win32",
     runCommandImpl(command, args) {
       captured = { command, args };
@@ -32,8 +32,8 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   assert.equal(outcome.method, "taskkill");
 });
 
-test("terminateProcessTree treats missing Windows processes as already stopped", () => {
-  const outcome = terminateProcessTree(1234, {
+test("terminateProcessTree treats missing Windows processes as already stopped", async () => {
+  const outcome = await terminateProcessTree(1234, {
     platform: "win32",
     runCommandImpl(command, args) {
       return {
@@ -54,11 +54,11 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.match(outcome.result.stdout, /not found/i);
 });
 
-test("terminateProcessTree terminates Unix descendant groups deepest-first", () => {
+test("terminateProcessTree terminates Unix descendant groups deepest-first", async () => {
   const signals = [];
   const alive = new Set([1234, 1235, 1236, 1237]);
   const parents = new Map([[1234, 1], [1235, 1234], [1236, 1235], [1237, 1234]]);
-  const outcome = terminateProcessTree(1234, {
+  const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
     runCommandImpl(command, args) {
       assert.equal(command, "/bin/ps");
@@ -93,10 +93,10 @@ test("terminateProcessTree terminates Unix descendant groups deepest-first", () 
   assert.deepEqual(outcome.targets, [1236, 1235, 1237, 1234]);
 });
 
-test("terminateProcessTree signals a Unix PID directly when it is not a group leader", () => {
+test("terminateProcessTree signals a Unix PID directly when it is not a group leader", async () => {
   const signals = [];
   let alive = true;
-  const outcome = terminateProcessTree(1234, {
+  const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
     runCommandImpl(command, args) {
       return {
@@ -121,30 +121,80 @@ test("terminateProcessTree signals a Unix PID directly when it is not a group le
   assert.equal(outcome.method, "process-tree");
 });
 
-test("terminateProcessTree fails closed when Unix process enumeration fails", () => {
-  assert.throws(
-    () =>
-      terminateProcessTree(1234, {
-        platform: "darwin",
-        runCommandImpl(command, args) {
-          return {
-            command,
-            args,
-            status: 1,
-            signal: null,
-            stdout: "",
-            stderr: "ps denied",
-            error: null
-          };
-        }
-      }),
-    /Unable to enumerate Unix processes.*ps denied/i
-  );
+test("terminateProcessTree parses a captured Linux procps process table", async () => {
+  const signals = [];
+  const alive = new Set([42001, 42002]);
+  const sample = [
+    "42001       1 42001 Ss   Mon Jul 27 12:34:56 2026",
+    "42002   42001 42002 S    Mon Jul 27 12:34:57 2026"
+  ].join("\n");
+  const outcome = await terminateProcessTree(42001, {
+    platform: "linux",
+    runCommandImpl(command, args) {
+      assert.equal(command, "/bin/ps");
+      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
+      const stdout = [...alive]
+        .map((pid) => sample.split("\n").find((line) => line.startsWith(String(pid))))
+        .filter(Boolean)
+        .join("\n");
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: stdout ? `${stdout}\n` : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+      alive.delete(Math.abs(pid));
+    }
+  });
+
+  assert.deepEqual(signals, [[-42002, "SIGTERM"], [-42001, "SIGTERM"]]);
+  assert.equal(outcome.verified, true);
+  assert.deepEqual(outcome.targets, [42002, 42001]);
 });
 
-test("terminateProcessTree refuses a reused root PID", () => {
+test("terminateProcessTree falls back to a direct child kill when Unix process enumeration fails", async () => {
   const signals = [];
-  const outcome = terminateProcessTree(1234, {
+  const warnings = [];
+  const outcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    warnImpl(message) {
+      warnings.push(message);
+    },
+    runCommandImpl(command, args) {
+      assert.equal(command, "/bin/ps");
+      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
+      return {
+        command,
+        args,
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: "ps denied",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(signals, [[1234, "SIGKILL"]]);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+  assert.deepEqual(outcome.survivors, []);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /direct-child kill fallback.*none known/i);
+});
+
+test("terminateProcessTree refuses a reused root PID", async () => {
+  const signals = [];
+  const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
     expectedRootIdentity: "1234@Sun Jul 26 00:00:00 2026",
     runCommandImpl(command, args) {
@@ -168,11 +218,11 @@ test("terminateProcessTree refuses a reused root PID", () => {
   assert.equal(outcome.identityMismatch, true);
 });
 
-test("terminateProcessTree revalidates descendant identities before signaling", () => {
+test("terminateProcessTree revalidates descendant identities before signaling", async () => {
   const signals = [];
   let rootAlive = true;
   let snapshots = 0;
-  const outcome = terminateProcessTree(1234, {
+  const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
     expectedRootIdentity: "1234@Mon Jul 27 00:00:00 2026",
     termPollAttempts: 1,
@@ -205,11 +255,11 @@ test("terminateProcessTree revalidates descendant identities before signaling", 
   assert.equal(outcome.escalated, false);
 });
 
-test("terminateProcessTree escalates resistant descendants and verifies exit", () => {
+test("terminateProcessTree escalates resistant descendants and verifies exit", async () => {
   const signals = [];
   const alive = new Set([1234, 1235]);
   const pgids = new Map([[1234, 1234], [1235, 1235]]);
-  const outcome = terminateProcessTree(1234, {
+  const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
     expectedRootIdentity: "1234@Mon Jul 27 00:00:00 2026",
     termPollAttempts: 1,

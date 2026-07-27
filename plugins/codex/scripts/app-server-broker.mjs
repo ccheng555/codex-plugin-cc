@@ -8,9 +8,11 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { getLiveProcessPids } from "./lib/process.mjs";
 
 const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const BROKER_CLEANUP_UNVERIFIED_RPC_CODE = -32002;
 
 function resolveChildIdleMs(env = process.env) {
   const raw = env.CODEX_COMPANION_BROKER_CHILD_IDLE_MS;
@@ -86,6 +88,7 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   let activeStreamRunning = false;
+  let blockedCleanup = null;
   const sockets = new Set();
 
   function cancelChildIdleClose() {
@@ -104,8 +107,30 @@ async function main() {
     );
   }
 
+  function clearStreamState() {
+    activeStreamRunning = false;
+    activeStreamSocket = null;
+    activeStreamThreadIds = null;
+  }
+
+  function recordUnverifiedCleanup(client) {
+    const outcome = client.cleanupOutcome;
+    if (!outcome || outcome.verified !== false) {
+      return;
+    }
+    const survivors = outcome.survivors ?? [];
+    blockedCleanup = {
+      degraded: Boolean(outcome.degraded) || survivors.length === 0,
+      survivors
+    };
+    process.stderr.write(
+      `Warning: shared Codex broker will not spawn a replacement after unverified cleanup; surviving PIDs: ${survivors.join(", ") || "none known"}.\n`
+    );
+  }
+
   async function closeAppClient() {
     cancelChildIdleClose();
+    clearStreamState();
     if (appClientStartPromise) {
       await appClientStartPromise.catch(() => {});
     }
@@ -118,9 +143,18 @@ async function main() {
     if (!client) {
       return;
     }
-    appClientClosePromise = client.close().catch(() => {}).finally(() => {
-      appClientClosePromise = null;
-    });
+    appClientClosePromise = client
+      .close()
+      .then(() => {
+        recordUnverifiedCleanup(client);
+      })
+      .catch((error) => {
+        blockedCleanup = { degraded: true, survivors: [] };
+        process.stderr.write(`Warning: shared Codex broker cleanup failed: ${error.message}. No replacement child will be spawned.\n`);
+      })
+      .finally(() => {
+        appClientClosePromise = null;
+      });
     await appClientClosePromise;
   }
 
@@ -144,7 +178,7 @@ async function main() {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
-      activeStreamSocket = null;
+      clearStreamState();
     }
   }
 
@@ -168,19 +202,48 @@ async function main() {
     }
   }
 
+  function ensureCleanupSafeToSpawn() {
+    if (blockedCleanup) {
+      if (blockedCleanup.survivors.length > 0) {
+        const liveSurvivors = getLiveProcessPids(blockedCleanup.survivors);
+        if (liveSurvivors.length > 0) {
+          const error = new Error(`Shared Codex broker cleanup is unverified; surviving PIDs: ${liveSurvivors.join(", ")}.`);
+          error.rpcCode = BROKER_CLEANUP_UNVERIFIED_RPC_CODE;
+          throw error;
+        }
+        blockedCleanup = null;
+      } else if (blockedCleanup.degraded) {
+        const error = new Error("Shared Codex broker cleanup is unverified; refusing to spawn a replacement child.");
+        error.rpcCode = BROKER_CLEANUP_UNVERIFIED_RPC_CODE;
+        throw error;
+      } else {
+        blockedCleanup = null;
+      }
+    }
+  }
+
   async function getAppClient() {
     cancelChildIdleClose();
+    ensureCleanupSafeToSpawn();
     if (appClient) {
       return appClient;
     }
     if (appClientClosePromise) {
       await appClientClosePromise;
+      ensureCleanupSafeToSpawn();
     }
     if (!appClientStartPromise) {
       appClientStartPromise = CodexAppServerClient.connect(cwd, { disableBroker: true })
         .then((client) => {
           appClient = client;
           client.setNotificationHandler(routeNotification);
+          client.setExitHandler(() => {
+            clearStreamState();
+            if (appClient === client) {
+              appClient = null;
+            }
+            scheduleChildIdleClose();
+          });
           return client;
         })
         .finally(() => {
@@ -324,10 +387,8 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (isStreaming && activeStreamSocket === socket) {
-            activeStreamRunning = false;
-            activeStreamSocket = null;
-            activeStreamThreadIds = null;
+          if (isStreaming) {
+            clearStreamState();
           }
         } finally {
           inFlightRequests -= 1;
