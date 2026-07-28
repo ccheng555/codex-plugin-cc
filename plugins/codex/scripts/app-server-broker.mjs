@@ -104,6 +104,11 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   let activeStreamRunning = false;
+  // Identifies the turn that owns the current stream. The owning socket may
+  // disconnect while the turn keeps running, so socket identity cannot be used
+  // to decide whether a late result still belongs to the active stream.
+  let activeStreamTurn = 0;
+  let streamTurnCounter = 0;
   let blockedCleanup = null;
   const sockets = new Set();
 
@@ -127,6 +132,7 @@ async function main() {
     activeStreamRunning = false;
     activeStreamSocket = null;
     activeStreamThreadIds = null;
+    activeStreamTurn = 0;
   }
 
   function recordUnverifiedCleanup(client) {
@@ -445,10 +451,13 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        let streamTurn = 0;
         if (isStreaming) {
           activeStreamRunning = true;
           activeStreamSocket = socket;
           activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, null);
+          streamTurn = ++streamTurnCounter;
+          activeStreamTurn = streamTurn;
         }
         inFlightRequests += 1;
 
@@ -456,7 +465,11 @@ async function main() {
           const client = await getAppClient();
           const result = await client.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming && activeStreamRunning && activeStreamSocket === socket) {
+          // Gate on the turn, not the socket: a client that disconnects mid-turn
+          // clears activeStreamSocket while the turn keeps running, and without
+          // the result-derived thread ids the completion notification can never
+          // match, leaving the broker busy forever.
+          if (isStreaming && activeStreamRunning && activeStreamTurn === streamTurn) {
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
           if (activeRequestSocket === socket) {
