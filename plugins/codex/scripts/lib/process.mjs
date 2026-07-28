@@ -142,6 +142,58 @@ function collectProcessTree(rootPid, processes, rootDepth = 0) {
   return records;
 }
 
+export function captureProcessOwnership(pid, options = {}) {
+  if (!Number.isFinite(pid) || (options.platform ?? process.platform) === "win32") {
+    return null;
+  }
+
+  const processes = readUnixProcessTable(options.runCommandImpl ?? runCommand, options);
+  const root = processes.get(pid);
+  if (!root) {
+    return null;
+  }
+
+  return {
+    rootPid: root.pid,
+    rootIdentity: root.identity,
+    processGroupId: root.processGroupId,
+    members: collectProcessTree(pid, processes).map((record) => ({ ...record }))
+  };
+}
+
+function recordsFromOwnershipSnapshot(snapshot) {
+  return (snapshot?.members ?? []).filter((record) => {
+    return Number.isFinite(record.pid) && typeof record.identity === "string" && record.identity.length > 0;
+  });
+}
+
+function identitiesByPid(identities) {
+  const result = new Map();
+  for (const identity of identities ?? []) {
+    const match = String(identity).match(/^(\d+)@/);
+    if (match) {
+      result.set(Number(match[1]), String(identity));
+    }
+  }
+  return result;
+}
+
+export function normalizeProcessCleanupOutcome(outcome = {}) {
+  return {
+    attempted: Boolean(outcome.attempted),
+    delivered: Boolean(outcome.delivered),
+    verified: outcome.verified === true,
+    degraded: Boolean(outcome.degraded),
+    method: outcome.method ?? null,
+    escalated: Boolean(outcome.escalated),
+    targets: Array.isArray(outcome.targets) ? outcome.targets : [],
+    targetIdentities: Array.isArray(outcome.targetIdentities) ? outcome.targetIdentities : [],
+    survivors: Array.isArray(outcome.survivors) ? outcome.survivors : [],
+    survivorIdentities: Array.isArray(outcome.survivorIdentities) ? outcome.survivorIdentities : [],
+    ...(outcome.identityMismatch ? { identityMismatch: true } : {})
+  };
+}
+
 function sleep(milliseconds) {
   if (milliseconds <= 0) {
     return Promise.resolve();
@@ -157,7 +209,8 @@ export function getProcessIdentity(pid, options = {}) {
 }
 
 export function getLiveProcessPids(pids, options = {}) {
-  const candidates = [...new Set(pids.filter((pid) => Number.isFinite(pid)))];
+  const candidates = [...new Set((pids ?? []).filter((pid) => Number.isFinite(pid)))];
+  const expectedIdentities = identitiesByPid(options.identities);
   if (candidates.length === 0) {
     return [];
   }
@@ -175,7 +228,10 @@ export function getLiveProcessPids(pids, options = {}) {
 
   try {
     const processes = readUnixProcessTable(options.runCommandImpl ?? runCommand, options);
-    return candidates.filter((pid) => isRunningProcess(processes.get(pid)));
+    return candidates.filter((pid) => {
+      const current = processes.get(pid);
+      return isRunningProcess(current) && (!expectedIdentities.has(pid) || expectedIdentities.get(pid) === current.identity);
+    });
   } catch {
     // An unverified cleanup remains blocked when liveness cannot be checked.
     return candidates;
@@ -345,7 +401,7 @@ function degradedDirectChildKill(pid, options, killImpl, reason) {
     `Unable to verify Unix process cleanup for PID ${pid}; used direct-child kill fallback (${String(reason).replace(/\s+/g, " ").trim()}). Surviving PIDs: none known.`,
     options
   );
-  return {
+  return normalizeProcessCleanupOutcome({
     attempted: true,
     delivered,
     verified: false,
@@ -353,13 +409,26 @@ function degradedDirectChildKill(pid, options, killImpl, reason) {
     degraded: true,
     method: "direct-child",
     targets: [pid],
-    survivors: []
-  };
+    targetIdentities: options.expectedRootIdentity ? [options.expectedRootIdentity] : [],
+    survivors: [],
+    survivorIdentities: []
+  });
 }
 
 export async function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
-    return { attempted: false, delivered: false, method: null };
+    const ownershipSnapshot = options.ownershipSnapshot ?? null;
+    if (Number.isFinite(ownershipSnapshot?.rootPid)) {
+      return terminateProcessTree(ownershipSnapshot.rootPid, options);
+    }
+    const ownershipEstablished = Boolean(options.expectedRootIdentity || options.requireVerifiedOwnership);
+    return normalizeProcessCleanupOutcome({
+      attempted: false,
+      delivered: false,
+      verified: !ownershipEstablished,
+      degraded: ownershipEstablished,
+      method: null
+    });
   }
 
   const platform = options.platform ?? process.platform;
@@ -373,21 +442,21 @@ export async function terminateProcessTree(pid, options = {}) {
     });
 
     if (!result.error && result.status === 0) {
-      return { attempted: true, delivered: true, method: "taskkill", result };
+      return { ...normalizeProcessCleanupOutcome({ attempted: true, delivered: true, verified: true, method: "taskkill" }), result };
     }
 
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
     if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
-      return { attempted: true, delivered: false, method: "taskkill", result };
+      return { ...normalizeProcessCleanupOutcome({ attempted: true, delivered: false, verified: true, method: "taskkill" }), result };
     }
 
     if (result.error?.code === "ENOENT") {
       try {
         killImpl(pid);
-        return { attempted: true, delivered: true, method: "kill" };
+        return normalizeProcessCleanupOutcome({ attempted: true, delivered: true, verified: true, method: "kill" });
       } catch (error) {
         if (error?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "kill" };
+          return normalizeProcessCleanupOutcome({ attempted: true, delivered: false, verified: true, method: "kill" });
         }
         throw error;
       }
@@ -410,31 +479,38 @@ export async function terminateProcessTree(pid, options = {}) {
     return degradedDirectChildKill(pid, options, killImpl, error.message);
   }
   const root = initialProcesses.get(pid);
-  const expectedRootIdentity = options.expectedRootIdentity ?? root?.identity ?? null;
+  const ownershipSnapshot = options.ownershipSnapshot ?? null;
+  const ownershipEstablished = Boolean(ownershipSnapshot || options.expectedRootIdentity || options.requireVerifiedOwnership);
+  const expectedRootIdentity = options.expectedRootIdentity ?? ownershipSnapshot?.rootIdentity ?? root?.identity ?? null;
   if (!root) {
-    return {
-      attempted: true,
-      delivered: false,
-      verified: true,
-      escalated: false,
-      method: "process-tree",
-      targets: []
-    };
+    if (!ownershipSnapshot) {
+      return normalizeProcessCleanupOutcome({
+        attempted: true,
+        delivered: false,
+        verified: !ownershipEstablished,
+        degraded: ownershipEstablished,
+        method: "process-tree",
+        targets: []
+      });
+    }
   }
-  if (root.identity !== expectedRootIdentity) {
-    return {
+  if (root && root.identity !== expectedRootIdentity) {
+    return normalizeProcessCleanupOutcome({
       attempted: true,
       delivered: false,
-      verified: true,
-      escalated: false,
+      verified: false,
+      degraded: ownershipEstablished,
       identityMismatch: true,
       method: "process-tree",
       targets: []
-    };
+    });
   }
 
   const tracked = new Map();
-  for (const record of collectProcessTree(pid, initialProcesses)) {
+  for (const record of recordsFromOwnershipSnapshot(ownershipSnapshot)) {
+    tracked.set(record.identity, record);
+  }
+  for (const record of root ? collectProcessTree(pid, initialProcesses) : []) {
     tracked.set(record.identity, record);
   }
   const unixOptions = {
@@ -473,17 +549,24 @@ export async function terminateProcessTree(pid, options = {}) {
       live = phaseLive;
     }
 
-    return {
+    const verified =
+      live.length === 0 &&
+      !options.requireVerifiedOwnership &&
+      (root !== undefined || ownershipSnapshot !== null);
+    return normalizeProcessCleanupOutcome({
       attempted: true,
       delivered,
-      verified: live.length === 0,
+      verified,
+      degraded: ownershipEstablished && !verified,
       escalated,
       method: "process-tree",
       // The algorithm covers same-process-group descendants plus those observed at scan time.
       // A post-scan setsid descendant can escape the tracked process tree.
       targets: [...tracked.values()].sort((left, right) => right.depth - left.depth).map((record) => record.pid),
-      survivors: live.map((record) => record.pid)
-    };
+      targetIdentities: [...tracked.values()].sort((left, right) => right.depth - left.depth).map((record) => record.identity),
+      survivors: live.map((record) => record.pid),
+      survivorIdentities: live.map((record) => record.identity)
+    });
   } catch (error) {
     if (error?.code !== "PROCESS_TABLE_UNAVAILABLE") {
       throw error;
@@ -494,10 +577,10 @@ export async function terminateProcessTree(pid, options = {}) {
 
 export async function terminateProcessGroup(pgid, options = {}) {
   if (!Number.isFinite(pgid)) {
-    return { attempted: false, delivered: false, verified: true, survivors: [] };
+    return normalizeProcessCleanupOutcome({ attempted: false, delivered: false, verified: false, degraded: true });
   }
   if ((options.platform ?? process.platform) === "win32") {
-    return { attempted: false, delivered: false, verified: true, survivors: [] };
+    return normalizeProcessCleanupOutcome({ attempted: false, delivered: false, verified: false, degraded: true });
   }
 
   const runCommandImpl = options.runCommandImpl ?? runCommand;
@@ -514,17 +597,45 @@ export async function terminateProcessGroup(pgid, options = {}) {
       `Unable to enumerate Unix processes while reclaiming process group ${pgid}; surviving PIDs unknown.`,
       options
     );
-    return { attempted: false, delivered: false, verified: false, degraded: true, survivors: [] };
+    return normalizeProcessCleanupOutcome({
+      attempted: false,
+      delivered: false,
+      verified: false,
+      degraded: true,
+      survivors: recordsFromOwnershipSnapshot(options.ownershipSnapshot).map((record) => record.pid),
+      survivorIdentities: recordsFromOwnershipSnapshot(options.ownershipSnapshot).map((record) => record.identity)
+    });
   }
 
   const tracked = new Map();
+  const ownershipSnapshot = options.ownershipSnapshot ?? null;
+  const ownershipEstablished = Boolean(ownershipSnapshot);
+  for (const record of recordsFromOwnershipSnapshot(ownershipSnapshot)) {
+    tracked.set(record.identity, record);
+  }
+  let groupSelectionFound = false;
   for (const record of processes.values()) {
+    if (record.processGroupId !== pgid || !isRunningProcess(record)) {
+      continue;
+    }
+    const snapshotRecord = recordsFromOwnershipSnapshot(ownershipSnapshot).find((candidate) => candidate.pid === record.pid);
+    if (ownershipSnapshot && (!snapshotRecord || snapshotRecord.identity !== record.identity)) {
+      continue;
+    }
+    groupSelectionFound = true;
     if (record.processGroupId === pgid && isRunningProcess(record)) {
       tracked.set(record.identity, record);
     }
   }
   if (tracked.size === 0) {
-    return { attempted: false, delivered: false, verified: true, survivors: [] };
+    return normalizeProcessCleanupOutcome({
+      attempted: false,
+      delivered: false,
+      verified: !ownershipEstablished,
+      degraded: ownershipEstablished,
+      survivors: [],
+      survivorIdentities: []
+    });
   }
 
   const unixOptions = {
@@ -545,15 +656,19 @@ export async function terminateProcessGroup(pgid, options = {}) {
       delivered = signalTracked(tracked, "SIGKILL", unixOptions) || delivered;
       live = await pollTracked(tracked, unixOptions, options.killPollAttempts ?? 11);
     }
-    return {
+    const root = processes.get(pgid);
+    return normalizeProcessCleanupOutcome({
       attempted: true,
       delivered,
-      verified: live.length === 0,
+      verified: live.length === 0 && (!ownershipEstablished || (root?.identity === ownershipSnapshot.rootIdentity && groupSelectionFound)),
+      degraded: ownershipEstablished && (root?.identity !== ownershipSnapshot.rootIdentity || !groupSelectionFound),
       escalated,
       method: "process-group",
       targets: [...tracked.values()].map((record) => record.pid),
-      survivors: live.map((record) => record.pid)
-    };
+      targetIdentities: [...tracked.values()].map((record) => record.identity),
+      survivors: live.map((record) => record.pid),
+      survivorIdentities: live.map((record) => record.identity)
+    });
   } catch (error) {
     if (error?.code !== "PROCESS_TABLE_UNAVAILABLE") {
       throw error;
@@ -562,7 +677,7 @@ export async function terminateProcessGroup(pgid, options = {}) {
       `Unable to verify Unix process-group cleanup for pgid ${pgid}; surviving PIDs unknown.`,
       options
     );
-    return { attempted: true, delivered: true, verified: false, degraded: true, survivors: [] };
+    return normalizeProcessCleanupOutcome({ attempted: true, delivered: true, verified: false, degraded: true, survivors: [], survivorIdentities: [] });
   }
 }
 

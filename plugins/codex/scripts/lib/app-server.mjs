@@ -14,10 +14,11 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { getProcessIdentity, terminateProcessTree } from "./process.mjs";
+import { captureProcessOwnership, normalizeProcessCleanupOutcome, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
+const DEFAULT_CLOSE_WAIT_MS = 2000;
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
@@ -233,27 +234,21 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });
     try {
-      this.procIdentity =
+      const captureOwnership = this.options.captureProcessOwnershipImpl ?? captureProcessOwnership;
+      this.ownershipSnapshot =
         process.platform === "win32"
           ? null
-          : getProcessIdentity(this.proc.pid, {
+          : captureOwnership(this.proc.pid, {
               cwd: this.cwd,
               env: this.options.env ?? process.env
             });
+      this.procIdentity = this.ownershipSnapshot?.rootIdentity ?? null;
     } catch (error) {
-      try {
-        this.proc.kill("SIGKILL");
-      } catch {
-        // The child may have exited before identity capture completed.
-      }
+      this.identityCaptureFailed = true;
       throw error;
     }
     if (process.platform !== "win32" && !this.procIdentity) {
-      try {
-        this.proc.kill("SIGKILL");
-      } catch {
-        // The child may have exited before identity capture completed.
-      }
+      this.identityCaptureFailed = true;
       throw new Error("Unable to capture codex app-server process identity.");
     }
     this.notify("initialized", {});
@@ -261,7 +256,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
   async close() {
     if (this.closed) {
-      await this.exitPromise;
+      await this.waitForExit();
       return;
     }
 
@@ -271,17 +266,22 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.readline.close();
     }
 
-    if (this.proc && !this.proc.killed) {
-      this.proc.stdin.end();
+    if (this.proc) {
+      try {
+        this.proc.stdin.end();
+      } catch {
+        // The child may have closed its input before cleanup began.
+      }
       if (process.platform === "win32") {
         setTimeout(() => {
           if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-            void terminateProcessTree(this.proc.pid)
+            void terminateProcessTree(this.proc.pid, {
+              expectedRootIdentity: this.procIdentity,
+              ownershipSnapshot: this.ownershipSnapshot,
+              requireVerifiedOwnership: this.identityCaptureFailed
+            })
               .then((outcome) => {
-                this.cleanupOutcome = {
-                  verified: outcome.verified ?? null,
-                  survivors: outcome.survivors ?? []
-                };
+                this.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
               })
               .catch(() => {
                 // Best-effort cleanup inside an unref'd timer — swallow errors
@@ -294,13 +294,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
         // the group so MCP helpers cannot outlive the app-server parent.
         const outcome = await terminateProcessTree(this.proc.pid, {
           expectedRootIdentity: this.procIdentity,
+          ownershipSnapshot: this.ownershipSnapshot,
+          requireVerifiedOwnership: this.identityCaptureFailed,
           directKillImpl: (signal) => this.proc.kill(signal),
           warnImpl: () => {}
         });
-        this.cleanupOutcome = {
-          verified: outcome.verified ?? false,
-          survivors: outcome.survivors ?? []
-        };
+        this.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
         if (!outcome.verified) {
           process.stderr.write(
             `Warning: unable to verify codex app-server cleanup; surviving PIDs: ${outcome.survivors?.join(", ") || "none known"}.\n`
@@ -309,7 +308,26 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       }
     }
 
-    await this.exitPromise;
+    const exited = await this.waitForExit();
+    if (!exited) {
+      this.cleanupOutcome = normalizeProcessCleanupOutcome({
+        ...(this.cleanupOutcome ?? {}),
+        attempted: true,
+        verified: false,
+        degraded: true
+      });
+    }
+  }
+
+  async waitForExit() {
+    const timeoutMs = Number.isFinite(this.options.closeWaitMs) ? this.options.closeWaitMs : DEFAULT_CLOSE_WAIT_MS;
+    let timeout;
+    const timedOut = new Promise((resolve) => {
+      timeout = setTimeout(() => resolve(false), timeoutMs);
+    });
+    const exited = await Promise.race([this.exitPromise.then(() => true), timedOut]);
+    clearTimeout(timeout);
+    return exited;
   }
 
   sendMessage(message) {

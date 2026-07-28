@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { getLiveProcessPids, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", async () => {
   let captured = null;
@@ -30,6 +30,26 @@ test("terminateProcessTree uses taskkill on Windows", async () => {
   });
   assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");
+});
+
+test("getLiveProcessPids ignores a survivor PID reused by a different process", () => {
+  const live = getLiveProcessPids([900], {
+    platform: "darwin",
+    identities: ["900@old"],
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "900 1 900 S Mon Jul 27 00:00:02 2026\n",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.deepEqual(live, []);
 });
 
 test("terminateProcessTree treats missing Windows processes as already stopped", async () => {
@@ -214,8 +234,57 @@ test("terminateProcessTree refuses a reused root PID", async () => {
   });
 
   assert.deepEqual(signals, []);
-  assert.equal(outcome.verified, true);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
   assert.equal(outcome.identityMismatch, true);
+  const ownershipSnapshot = {
+    rootPid: 1234,
+    rootIdentity: "1234@Mon Jul 27 00:00:00 2026",
+    processGroupId: 1234,
+    members: [
+      {
+        pid: 1234,
+        parentPid: 1,
+        processGroupId: 1234,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "1234@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      },
+      {
+        pid: 1235,
+        parentPid: 1234,
+        processGroupId: 1235,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:01 2026",
+        identity: "1235@Mon Jul 27 00:00:01 2026",
+        depth: 1
+      }
+    ]
+  };
+  const cleanOutcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    ownershipSnapshot,
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl() {
+      throw new Error("no process should be signaled");
+    }
+  });
+
+  assert.equal(cleanOutcome.verified, true);
+  assert.equal(cleanOutcome.degraded, false);
+  assert.deepEqual(cleanOutcome.survivors, []);
+  assert.deepEqual(cleanOutcome.survivorIdentities, []);
 });
 
 test("terminateProcessTree revalidates descendant identities before signaling", async () => {
@@ -422,4 +491,59 @@ test("terminateProcessGroup reclaims orphaned members of a dead leader's group",
   assert.equal(outcome.verified, true);
   assert.equal(outcome.method, "process-group");
   assert.deepEqual(outcome.targets, [202]);
+});
+
+test("terminateProcessGroup hunts an observed regrouped helper after its root exits", async () => {
+  const signals = [];
+  const alive = new Set([200]);
+  const ownershipSnapshot = {
+    rootPid: 100,
+    rootIdentity: "100@Mon Jul 27 00:00:00 2026",
+    processGroupId: 100,
+    members: [
+      {
+        pid: 100,
+        parentPid: 1,
+        processGroupId: 100,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "100@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      },
+      {
+        pid: 200,
+        parentPid: 100,
+        processGroupId: 200,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:01 2026",
+        identity: "200@Mon Jul 27 00:00:01 2026",
+        depth: 1
+      }
+    ]
+  };
+  const outcome = await terminateProcessGroup(100, {
+    platform: "darwin",
+    ownershipSnapshot,
+    pollIntervalMs: 0,
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: alive.has(200) ? "200 1 200 S Mon Jul 27 00:00:01 2026\n" : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+      alive.delete(Math.abs(pid));
+    }
+  });
+
+  assert.deepEqual(signals, [[-200, "SIGTERM"]]);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+  assert.deepEqual(outcome.survivors, []);
 });

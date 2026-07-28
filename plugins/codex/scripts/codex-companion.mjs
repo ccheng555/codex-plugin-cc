@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
@@ -960,7 +960,7 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleCancel(argv) {
+export async function handleCancel(argv, dependencies = {}) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
@@ -973,7 +973,7 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = await (dependencies.interruptAppServerTurnImpl ?? interruptAppServerTurn)(cwd, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -983,7 +983,33 @@ async function handleCancel(argv) {
     );
   }
 
-  await terminateProcessTree(job.pid ?? Number.NaN);
+  const cleanupOutcome = await (dependencies.terminateProcessTreeImpl ?? terminateProcessTree)(job.pid ?? Number.NaN, {
+    expectedRootIdentity: existing.processIdentity ?? job.processIdentity ?? null,
+    ownershipSnapshot: existing.ownershipSnapshot ?? job.ownershipSnapshot ?? null
+  });
+  if (cleanupOutcome?.verified !== true) {
+    const failureMessage = `Unable to verify cleanup for ${job.id}; ownership records were preserved for retry.`;
+    appendLogLine(job.logFile, failureMessage);
+    const recoveryRecord = {
+      ...existing,
+      ...job,
+      status: job.status,
+      phase: "cleanup-pending",
+      pid: job.pid ?? existing.pid ?? null,
+      cleanupOutcome,
+      cleanupFailure: failureMessage
+    };
+    writeJobFile(workspaceRoot, job.id, recoveryRecord);
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: job.status,
+      phase: "cleanup-pending",
+      pid: job.pid ?? existing.pid ?? null,
+      cleanupOutcome,
+      cleanupFailure: failureMessage
+    });
+    throw new Error(failureMessage);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1066,8 +1092,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}

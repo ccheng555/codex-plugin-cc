@@ -7,8 +7,12 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir as createTempDir, run } from "./helpers.mjs";
+import { handleCancel } from "../plugins/codex/scripts/codex-companion.mjs";
+import { cleanupSessionJobs } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { ensureBrokerSession, loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { isBrokerRequestAllowedDuringShutdown } from "../plugins/codex/scripts/app-server-broker.mjs";
+import { ensureBrokerSession, loadBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { captureProcessOwnership, terminateProcessGroup } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -44,6 +48,107 @@ test.after(() => {
   }
 
   assert.deepEqual(cleanupFailures, []);
+});
+
+test("broker rejects queued work after shutdown begins", () => {
+  assert.equal(isBrokerRequestAllowedDuringShutdown(true, { id: 2, method: "thread/list" }), false);
+  assert.equal(isBrokerRequestAllowedDuringShutdown(true, { id: 3, method: "broker/shutdown" }), true);
+  assert.equal(isBrokerRequestAllowedDuringShutdown(false, { id: 4, method: "thread/list" }), true);
+});
+
+test("fake app-server crash reclaims an observed regrouped helper without replacement", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "crash-with-regrouped-helper");
+  const env = buildEnv(binDir);
+  const child = spawn("codex", ["app-server"], {
+    cwd: repo,
+    env,
+    detached: true,
+    stdio: ["pipe", "pipe", "ignore"]
+  });
+  child.stdout.setEncoding("utf8");
+  let buffer = "";
+  const initialized = new Promise((resolve, reject) => {
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) {
+        return;
+      }
+      resolve(JSON.parse(buffer.slice(0, newline)));
+    });
+    child.once("error", reject);
+  });
+  child.stdin.write(`${JSON.stringify({ id: 1, method: "initialize", params: { capabilities: {} } })}\n`);
+  const response = await initialized;
+  assert.equal(response.id, 1);
+  await waitFor(() => fs.existsSync(fakeStatePath) && JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).helperPids?.length === 1);
+  const helperPid = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).helperPids[0];
+  t.after(() => {
+    try {
+      process.kill(helperPid, "SIGKILL");
+    } catch {
+      // Ignore the helper after cleanup.
+    }
+  });
+  let ownershipSnapshot;
+  try {
+    ownershipSnapshot = captureProcessOwnership(child.pid, { env });
+  } catch (error) {
+    if (error?.code === "PROCESS_TABLE_UNAVAILABLE") {
+      t.skip(`process table unavailable: ${error.message}`);
+      return;
+    }
+    throw error;
+  }
+  await new Promise((resolve) => child.once("exit", resolve));
+  const outcome = await terminateProcessGroup(child.pid, { ownershipSnapshot, env });
+
+  assert.equal(outcome.verified, false);
+  assert.deepEqual(outcome.survivors, []);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
+});
+
+test("broker shutdown completes without starting a second app-server", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "with-resistant-helper");
+  const env = buildEnv(binDir);
+  const brokerSocketPath = path.join("/private/tmp", `cxc-p1c-${process.pid}-${Date.now()}.sock`);
+  const brokerSession = await ensureBrokerSession(repo, {
+    env,
+    createBrokerEndpoint: () => `unix:${brokerSocketPath}`
+  });
+  if (!brokerSession) {
+    t.skip("broker socket unavailable in this sandbox");
+    return;
+  }
+  assert.ok(brokerSession.pid);
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+  });
+
+  const client = await CodexAppServerClient.connect(repo, { env });
+  await client.request("thread/list", { cwd: repo });
+  const appServerStartsBeforeShutdown = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts;
+  assert.equal(appServerStartsBeforeShutdown, 1);
+  await sendBrokerShutdown(brokerSession.endpoint);
+  await waitFor(() => {
+    try {
+      process.kill(brokerSession.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, appServerStartsBeforeShutdown);
 });
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
@@ -1748,6 +1853,81 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
 });
 
+test("unverified cleanup preserves cancel, session, and broker ownership records", async () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const logFile = path.join(jobsDir, "task-live.log");
+  const jobFile = path.join(jobsDir, "task-live.json");
+  const job = {
+    id: "task-live",
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    sessionId: "sess-current",
+    pid: 123,
+    processIdentity: "123@old",
+    logFile
+  };
+  fs.writeFileSync(logFile, "starting\n", "utf8");
+  fs.writeFileSync(jobFile, `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const cleanupOutcome = {
+    attempted: true,
+    delivered: true,
+    verified: false,
+    degraded: true,
+    survivors: [123],
+    survivorIdentities: ["123@old"]
+  };
+  await assert.rejects(
+    handleCancel(["task-live", "--cwd", workspace, "--json"], {
+      interruptAppServerTurnImpl: async () => ({ attempted: false, interrupted: false }),
+      terminateProcessTreeImpl: async () => cleanupOutcome
+    }),
+    /ownership records were preserved for retry/
+  );
+  let state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "running");
+  assert.equal(state.jobs[0].pid, 123);
+  assert.deepEqual(state.jobs[0].cleanupOutcome.survivorIdentities, ["123@old"]);
+
+  const sessionCleanup = await cleanupSessionJobs(workspace, "sess-current", {
+    terminateProcessTreeImpl: async () => cleanupOutcome
+  });
+  assert.equal(sessionCleanup.verified, false);
+  state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].pid, 123);
+  assert.equal(fs.existsSync(jobFile), true);
+
+  const sessionDir = path.join(workspace, "broker-session");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const brokerLog = path.join(sessionDir, "broker.log");
+  const endpointPath = path.join(sessionDir, "broker.sock");
+  fs.writeFileSync(pidFile, "456\n", "utf8");
+  fs.writeFileSync(brokerLog, "broker\n", "utf8");
+  fs.writeFileSync(endpointPath, "socket-marker\n", "utf8");
+  const brokerCleanup = await teardownBrokerSession({
+    endpoint: `unix:${endpointPath}`,
+    pidFile,
+    logFile: brokerLog,
+    sessionDir,
+    pid: 456,
+    killProcess: async () => cleanupOutcome
+  });
+  assert.equal(brokerCleanup.verified, false);
+  assert.equal(fs.existsSync(pidFile), true);
+  assert.equal(fs.existsSync(brokerLog), true);
+  assert.equal(fs.existsSync(endpointPath), true);
+});
+
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -2474,6 +2654,43 @@ test("shared broker releases its idle app-server child and restarts it on demand
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 2);
   assert.equal(fakeState.helperPids.length, 2);
+});
+
+test("identity capture failure cleans the owned app-server tree and reports unverified cleanup", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installFakeCodex(binDir, "with-helper-child");
+  const env = buildEnv(binDir);
+  await assert.rejects(
+    CodexAppServerClient.connect(repo, {
+      disableBroker: true,
+      env,
+      captureProcessOwnershipImpl() {
+        throw new Error("identity lookup injected failure");
+      }
+    }),
+    (error) => error.cleanupOutcome?.verified === false && error.cleanupOutcome?.degraded === true
+  );
+
+  const helperPid = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).helperPids[0];
+  function isRunning(pid) {
+    const result = run("/bin/ps", ["-o", "stat=", "-p", String(pid)]);
+    return result.status === 0 && !result.stdout.trim().startsWith("Z");
+  }
+  await waitFor(() => {
+    return !isRunning(helperPid);
+  });
+  const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(state.appServerStarts, 1);
+  t.after(() => {
+    try {
+      process.kill(helperPid, "SIGKILL");
+    } catch {
+      // Ignore the helper after cleanup.
+    }
+  });
 });
 
 test("shared broker keeps active work alive after its client disconnects", async (t) => {

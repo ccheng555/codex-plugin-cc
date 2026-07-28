@@ -4,15 +4,21 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { getLiveProcessPids, terminateProcessGroup } from "./lib/process.mjs";
+import { getLiveProcessPids, normalizeProcessCleanupOutcome, terminateProcessGroup } from "./lib/process.mjs";
 
 const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const BROKER_CLEANUP_UNVERIFIED_RPC_CODE = -32002;
+const BROKER_SHUTDOWN_RPC_CODE = -32003;
+
+export function isBrokerRequestAllowedDuringShutdown(shuttingDown, message) {
+  return !shuttingDown || message?.method === "broker/shutdown";
+}
 
 function resolveChildIdleMs(env = process.env) {
   const raw = env.CODEX_COMPANION_BROKER_CHILD_IDLE_MS;
@@ -43,6 +49,15 @@ function send(socket, message) {
     return;
   }
   socket.write(`${JSON.stringify(message)}\n`);
+}
+
+function flushSocket(socket) {
+  if (socket.destroyed) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    socket.write("", () => resolve(true));
+  });
 }
 
 function isInterruptRequest(message) {
@@ -84,6 +99,7 @@ async function main() {
   let childIdleTimer = null;
   let inFlightRequests = 0;
   let shutdownPromise = null;
+  let shuttingDown = false;
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
@@ -121,7 +137,8 @@ async function main() {
     const survivors = outcome.survivors ?? [];
     blockedCleanup = {
       degraded: Boolean(outcome.degraded) || survivors.length === 0,
-      survivors
+      survivors,
+      survivorIdentities: outcome.survivorIdentities ?? []
     };
     process.stderr.write(
       `Warning: shared Codex broker will not spawn a replacement after unverified cleanup; surviving PIDs: ${survivors.join(", ") || "none known"}.\n`
@@ -208,7 +225,9 @@ async function main() {
   function ensureCleanupSafeToSpawn() {
     if (blockedCleanup) {
       if (blockedCleanup.survivors.length > 0) {
-        const liveSurvivors = getLiveProcessPids(blockedCleanup.survivors);
+        const liveSurvivors = getLiveProcessPids(blockedCleanup.survivors, {
+          identities: blockedCleanup.survivorIdentities
+        });
         if (liveSurvivors.length > 0) {
           const error = new Error(`Shared Codex broker cleanup is unverified; surviving PIDs: ${liveSurvivors.join(", ")}.`);
           error.rpcCode = BROKER_CLEANUP_UNVERIFIED_RPC_CODE;
@@ -226,6 +245,11 @@ async function main() {
   }
 
   async function getAppClient() {
+    if (shuttingDown) {
+      const error = new Error("Shared Codex broker is shutting down.");
+      error.rpcCode = BROKER_SHUTDOWN_RPC_CODE;
+      throw error;
+    }
     cancelChildIdleClose();
     ensureCleanupSafeToSpawn();
     if (appClient) {
@@ -233,6 +257,11 @@ async function main() {
     }
     if (appClientClosePromise) {
       await appClientClosePromise;
+      if (shuttingDown) {
+        const error = new Error("Shared Codex broker is shutting down.");
+        error.rpcCode = BROKER_SHUTDOWN_RPC_CODE;
+        throw error;
+      }
       ensureCleanupSafeToSpawn();
     }
     if (!appClientStartPromise) {
@@ -250,13 +279,11 @@ async function main() {
               // The child is a detached process-group leader; on an unexpected
               // exit its surviving helpers reparent away from the broker, so
               // reclaim the group before allowing a replacement to spawn.
-              appClientClosePromise = terminateProcessGroup(childPid)
+              appClientClosePromise = terminateProcessGroup(childPid, {
+                ownershipSnapshot: client.ownershipSnapshot
+              })
                 .then((outcome) => {
-                  client.cleanupOutcome = {
-                    verified: outcome.verified ?? false,
-                    survivors: outcome.survivors ?? [],
-                    degraded: outcome.degraded ?? false
-                  };
+                  client.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
                   recordUnverifiedCleanup(client);
                 })
                 .catch((error) => {
@@ -288,13 +315,17 @@ async function main() {
     if (shutdownPromise) {
       return shutdownPromise;
     }
+    shuttingDown = true;
+    const serverClosePromise = new Promise((resolve) => {
+      server.close(resolve);
+    });
     shutdownPromise = (async () => {
       cancelChildIdleClose();
       for (const socket of sockets) {
-        socket.end();
+        socket.destroy();
       }
       await closeAppClient();
-      await new Promise((resolve) => server.close(resolve));
+      await serverClosePromise;
       if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
         fs.unlinkSync(listenTarget.path);
       }
@@ -306,12 +337,20 @@ async function main() {
   }
 
   const server = net.createServer((socket) => {
+    if (shuttingDown) {
+      socket.destroy();
+      return;
+    }
     cancelChildIdleClose();
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
 
     socket.on("data", async (chunk) => {
+      if (shuttingDown) {
+        socket.destroy();
+        return;
+      }
       buffer += chunk;
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
@@ -349,9 +388,22 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
+          shuttingDown = true;
           send(socket, { id: message.id, result: {} });
+          await flushSocket(socket);
           await shutdown(server);
           process.exit(0);
+        }
+
+        if (!isBrokerRequestAllowedDuringShutdown(shuttingDown, message)) {
+          if (message.id !== undefined) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_SHUTDOWN_RPC_CODE, "Shared Codex broker is shutting down.")
+            });
+          }
+          socket.destroy();
+          continue;
         }
 
         if (message.id === undefined) {
@@ -454,7 +506,9 @@ async function main() {
   server.listen(listenTarget.path);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

@@ -117,7 +117,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
   }
 
   if (existing) {
-    await teardownBrokerSession({
+    const cleanup = await teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
       logFile: existing.logFile ?? null,
@@ -125,6 +125,11 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pid: existing.pid ?? null,
       killProcess: options.killProcess ?? null
     });
+    if (cleanup?.verified !== true) {
+      const error = new Error("Broker cleanup is unverified; refusing to start another broker session.");
+      error.code = "BROKER_CLEANUP_UNVERIFIED";
+      throw error;
+    }
     clearBrokerSession(cwd);
   }
 
@@ -148,7 +153,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
-    await teardownBrokerSession({
+    const cleanup = await teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
@@ -156,6 +161,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pid: child.pid ?? null,
       killProcess: options.killProcess ?? null
     });
+    if (cleanup?.verified !== true) {
+      return null;
+    }
     return null;
   }
 
@@ -170,12 +178,46 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
-export async function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
+export async function teardownBrokerSession({
+  endpoint = null,
+  pidFile,
+  logFile,
+  sessionDir = null,
+  pid = null,
+  pidIdentity = null,
+  ownershipSnapshot = null,
+  killProcess = null
+}) {
+  let cleanupOutcome = {
+    attempted: false,
+    delivered: false,
+    verified: true,
+    degraded: false,
+    method: null,
+    targets: [],
+    targetIdentities: [],
+    survivors: [],
+    survivorIdentities: []
+  };
   if (Number.isFinite(pid) && killProcess) {
     try {
-      await killProcess(pid);
-    } catch {
-      // Ignore missing or already-exited broker processes.
+      const outcome = await killProcess(pid, {
+        expectedRootIdentity: pidIdentity,
+        ownershipSnapshot
+      });
+      cleanupOutcome = outcome ?? {
+        ...cleanupOutcome,
+        attempted: true,
+        verified: false,
+        degraded: true
+      };
+    } catch (error) {
+      if (error?.code !== "ESRCH" && error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    if (cleanupOutcome.verified !== true) {
+      return cleanupOutcome;
     }
   }
 
@@ -206,4 +248,5 @@ export async function teardownBrokerSession({ endpoint = null, pidFile, logFile,
       // Ignore non-empty or missing directories.
     }
   }
+  return cleanupOutcome;
 }

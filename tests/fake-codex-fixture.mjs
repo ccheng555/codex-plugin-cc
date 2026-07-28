@@ -273,13 +273,19 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
-if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-child") {
-  const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-child" || BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "with-resistant-helper") {
+  const helperCode = BEHAVIOR === "with-resistant-helper"
+    ? "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
+    : "setInterval(() => {}, 1000)";
+  const helper = spawn(process.execPath, ["-e", helperCode], {
     detached: process.platform !== "win32",
     stdio: "ignore"
   });
   helper.unref();
   bootState.helperPids = [...(bootState.helperPids || []), helper.pid];
+}
+if (BEHAVIOR === "crash-with-regrouped-helper") {
+  bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 }
 saveState(bootState);
 
@@ -298,6 +304,9 @@ rl.on("line", (line) => {
         state.capabilities = message.params.capabilities || null;
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
+        if (BEHAVIOR === "crash-with-regrouped-helper") {
+          setTimeout(() => process.exit(1), 100);
+        }
         break;
 
       case "initialized":
