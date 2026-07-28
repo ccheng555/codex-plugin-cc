@@ -13,7 +13,7 @@ import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mj
 import { isBrokerRequestAllowedDuringShutdown } from "../plugins/codex/scripts/app-server-broker.mjs";
 import { ensureBrokerSession, loadBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
-import { captureProcessOwnership, getProcessIdentity, terminateProcessGroup } from "../plugins/codex/scripts/lib/process.mjs";
+import { captureProcessOwnership, getProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { hasCancelFlag, listJobs, loadState, resolveStateDir, saveState, upsertJob, writeCancelFlag, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
@@ -2209,6 +2209,72 @@ test("cancelling a queued pid-less job prevents its worker from performing work"
   assert.equal(fs.existsSync(workMarker), false);
 });
 
+test("session cleanup preserves a queued cancel between worker read and pid publication", async () => {
+  const workspace = makeTempDir();
+  const sessionId = "sess-queued-worker-race";
+  const job = {
+    id: "task-session-end-race",
+    workspaceRoot: workspace,
+    kind: "task",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Exercise the SessionEnd startup race",
+    sessionId,
+    createdAt: "2026-07-28T08:03:00.000Z"
+  };
+  const request = {
+    cwd: workspace,
+    prompt: "Do not run after SessionEnd.",
+    jobId: job.id
+  };
+  const workMarker = path.join(workspace, "work-performed");
+  let firstCleanupPromise = null;
+  let cancelFlagSurvivedCleanup = false;
+
+  enqueueBackgroundTask(workspace, job, request, {
+    spawnDetachedTaskWorkerImpl() {}
+  });
+
+  await assert.rejects(
+    handleTaskWorker(["--cwd", workspace, "--job-id", job.id], {
+      getProcessIdentityImpl(pid) {
+        // handleTaskWorker has already read the queued record, but runTrackedJob
+        // has not yet published this worker's pid.
+        firstCleanupPromise = cleanupSessionJobs(workspace, sessionId);
+        cancelFlagSurvivedCleanup = hasCancelFlag(workspace, job.id);
+        return `${pid}@Mon Jul 28 08:03:01 2026`;
+      },
+      runTrackedJobImpl(candidate, _runner, options) {
+        return runTrackedJob(
+          candidate,
+          async () => {
+            fs.writeFileSync(workMarker, "ran\n", "utf8");
+            return {
+              exitStatus: 0,
+              payload: { ok: true },
+              rendered: "Work ran.",
+              summary: "Work ran."
+            };
+          },
+          options
+        );
+      }
+    }),
+    (error) => error?.code === "JOB_CANCELLED"
+  );
+
+  const firstCleanup = await firstCleanupPromise;
+  assert.equal(firstCleanup.verified, false);
+  assert.equal(cancelFlagSurvivedCleanup, true);
+  assert.equal(fs.existsSync(workMarker), false);
+  assert.equal(readStoredJob(workspace, job.id).status, "cancelled");
+
+  const finalCleanup = await cleanupSessionJobs(workspace, sessionId);
+  assert.equal(finalCleanup.verified, true);
+  assert.equal(readStoredJob(workspace, job.id), null);
+  assert.equal(hasCancelFlag(workspace, job.id), false);
+});
+
 test("worker converges a flagged running record to cancelled", async () => {
   const workspace = makeTempDir();
   const job = {
@@ -2366,6 +2432,72 @@ test("cancel reclaims a helper spawned after worker identity capture without an 
   await waitFor(() => !isRunning(helperPid));
   assert.equal(readStoredJob(workspace, job.id).status, "cancelled");
   assert.equal(Object.hasOwn(readStoredJob(workspace, job.id), "ownershipSnapshot"), false);
+});
+
+test("cancel and session cleanup converge after an identity-tracked worker exits abnormally", async () => {
+  const workspace = makeTempDir();
+  const sessionId = "sess-abnormal-worker-exit";
+  const job = {
+    id: "task-abnormal-worker-exit",
+    workspaceRoot: workspace,
+    kind: "task",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Clean up an exited worker",
+    sessionId,
+    status: "running",
+    phase: "running",
+    pid: 43210,
+    processIdentity: "43210@Mon Jul 28 08:05:00 2026",
+    createdAt: "2026-07-28T08:05:00.000Z"
+  };
+  let processTableReads = 0;
+  let terminateCalledDuringSessionCleanup = false;
+
+  writeJobFile(workspace, job.id, job);
+  upsertJob(workspace, job);
+
+  await handleCancel([job.id, "--cwd", workspace, "--json"], {
+    interruptAppServerTurnImpl: async () => ({ attempted: false, interrupted: false }),
+    terminateProcessTreeImpl(pid, options) {
+      return terminateProcessTree(pid, {
+        ...options,
+        platform: "darwin",
+        runCommandImpl(command, args) {
+          processTableReads += 1;
+          return {
+            command,
+            args,
+            status: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+            error: null
+          };
+        },
+        killImpl() {
+          throw new Error("an absent worker must not be signaled");
+        }
+      });
+    }
+  });
+
+  const cancelledJob = readStoredJob(workspace, job.id);
+  assert.equal(processTableReads, 1);
+  assert.equal(cancelledJob.status, "cancelled");
+  assert.equal(cancelledJob.pid, null);
+  assert.equal(cancelledJob.processIdentity, job.processIdentity);
+  assert.equal(Object.hasOwn(cancelledJob, "ownershipSnapshot"), false);
+
+  const sessionCleanup = await cleanupSessionJobs(workspace, sessionId, {
+    terminateProcessTreeImpl() {
+      terminateCalledDuringSessionCleanup = true;
+      throw new Error("terminal jobs must not be terminated again");
+    }
+  });
+  assert.equal(sessionCleanup.verified, true);
+  assert.equal(terminateCalledDuringSessionCleanup, false);
+  assert.equal(readStoredJob(workspace, job.id), null);
 });
 
 test("unverified cleanup preserves cancel, session, and broker ownership records", async () => {

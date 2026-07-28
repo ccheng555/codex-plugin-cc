@@ -509,18 +509,6 @@ export async function terminateProcessTree(pid, options = {}) {
       survivorIdentities: []
     });
   }
-  if (!root) {
-    if (!ownershipSnapshot) {
-      return normalizeProcessCleanupOutcome({
-        attempted: true,
-        delivered: false,
-        verified: !ownershipEstablished,
-        degraded: ownershipEstablished,
-        method: "process-tree",
-        targets: []
-      });
-    }
-  }
   if (root && expectedRootIdentity && root.identity !== expectedRootIdentity) {
     return normalizeProcessCleanupOutcome({
       attempted: true,
@@ -539,6 +527,20 @@ export async function terminateProcessTree(pid, options = {}) {
   }
   for (const record of root ? collectProcessTree(pid, initialProcesses) : []) {
     tracked.set(record.identity, record);
+  }
+  const sortedTracked = () =>
+    [...tracked.values()].sort((left, right) => right.depth - left.depth);
+  if (!root && listLiveTracked(tracked, initialProcesses).length === 0) {
+    const verified = !options.requireVerifiedOwnership && ownershipEstablished;
+    return normalizeProcessCleanupOutcome({
+      attempted: true,
+      delivered: false,
+      verified,
+      degraded: ownershipEstablished && !verified,
+      method: "process-tree",
+      targets: sortedTracked().map((record) => record.pid),
+      targetIdentities: sortedTracked().map((record) => record.identity)
+    });
   }
   let cleanupRootIdentity = expectedRootIdentity;
   if (!cleanupRootIdentity && captureFailureCleanupAllowed && root) {
@@ -585,7 +587,7 @@ export async function terminateProcessTree(pid, options = {}) {
     const verified =
       live.length === 0 &&
       !options.requireVerifiedOwnership &&
-      (root !== undefined || ownershipSnapshot !== null);
+      ownershipEstablished;
     return normalizeProcessCleanupOutcome({
       attempted: true,
       delivered,
@@ -595,8 +597,8 @@ export async function terminateProcessTree(pid, options = {}) {
       method: "process-tree",
       // The algorithm covers same-process-group descendants plus those observed at scan time.
       // A post-scan setsid descendant can escape the tracked process tree.
-      targets: [...tracked.values()].sort((left, right) => right.depth - left.depth).map((record) => record.pid),
-      targetIdentities: [...tracked.values()].sort((left, right) => right.depth - left.depth).map((record) => record.identity),
+      targets: sortedTracked().map((record) => record.pid),
+      targetIdentities: sortedTracked().map((record) => record.identity),
       survivors: live.map((record) => record.pid),
       survivorIdentities: live.map((record) => record.identity)
     });

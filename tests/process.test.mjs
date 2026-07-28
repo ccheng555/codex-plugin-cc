@@ -320,6 +320,33 @@ test("terminateProcessTree refuses a PID without persisted ownership", async () 
   assert.deepEqual(outcome.survivorIdentities, []);
 });
 
+test("terminateProcessTree refuses an absent PID without persisted ownership", async () => {
+  const outcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl() {
+      throw new Error("a PID without persisted ownership must not be signaled");
+    }
+  });
+
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+  assert.deepEqual(outcome.survivors, [1234]);
+  assert.deepEqual(outcome.survivorIdentities, []);
+});
+
 test("terminateProcessTree refuses capture-failure cleanup without a live owner handle", async () => {
   const identityObservedAtSpawn = "1234@Sun Jul 26 00:00:00 2026";
   const identityNowHoldingPid = "1234@Mon Jul 27 00:00:00 2026";

@@ -67,6 +67,7 @@ export async function cleanupSessionJobs(cwd, sessionId, dependencies = {}) {
     }
     if (job.status === "queued" && !Number.isFinite(job.pid)) {
       writeCancelFlag(workspaceRoot, job.id);
+      retainedJobs.push(job);
       continue;
     }
     try {
