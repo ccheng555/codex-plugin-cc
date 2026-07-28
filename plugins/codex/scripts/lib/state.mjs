@@ -107,7 +107,7 @@ export function saveState(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    removeJobFile(cwd, job.id);
     removeFileIfExists(job.logFile);
   }
 
@@ -174,10 +174,29 @@ export function readJobFile(jobFile) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
 }
 
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
+export function writeCancelFlag(cwd, jobId) {
+  const cancelFlag = resolveCancelFlag(cwd, jobId);
+  try {
+    fs.writeFileSync(cancelFlag, "", { flag: "wx" });
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
   }
+  return cancelFlag;
+}
+
+export function hasCancelFlag(cwd, jobId) {
+  return fs.existsSync(resolveCancelFlag(cwd, jobId));
+}
+
+export function removeCancelFlag(cwd, jobId) {
+  removeFileIfExists(resolveCancelFlag(cwd, jobId));
+}
+
+function removeJobFile(cwd, jobId) {
+  removeFileIfExists(resolveJobFile(cwd, jobId));
+  removeCancelFlag(cwd, jobId);
 }
 
 export function resolveJobLogFile(cwd, jobId) {
@@ -188,4 +207,8 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+function resolveCancelFlag(cwd, jobId) {
+  return resolveJobFile(cwd, jobId).replace(/\.json$/, ".cancelled");
 }

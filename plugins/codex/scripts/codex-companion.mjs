@@ -24,7 +24,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, captureProcessOwnership, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, getProcessIdentity, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -32,6 +32,7 @@ import {
   listJobs,
   setConfig,
   upsertJob,
+  writeCancelFlag,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -681,37 +682,23 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+export function enqueueBackgroundTask(cwd, job, request, dependencies = {}) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
-  let ownershipSnapshot = null;
-  let ownershipCaptureFailed = false;
-  if (process.platform !== "win32") {
-    try {
-      ownershipSnapshot = captureProcessOwnership(child.pid ?? Number.NaN, {
-        cwd,
-        env: process.env
-      });
-      ownershipCaptureFailed = !ownershipSnapshot?.rootIdentity;
-    } catch {
-      ownershipCaptureFailed = true;
-    }
-  }
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
-    processIdentity: ownershipSnapshot?.rootIdentity ?? null,
-    ownershipSnapshot,
-    ownershipCaptureFailed,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const spawnWorker = dependencies.spawnDetachedTaskWorkerImpl ?? spawnDetachedTaskWorker;
+  spawnWorker(cwd, job.id);
 
   return {
     payload: {
@@ -851,7 +838,7 @@ async function handleTransfer(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleTaskWorker(argv) {
+export async function handleTaskWorker(argv, dependencies = {}) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
   });
@@ -867,6 +854,20 @@ async function handleTaskWorker(argv) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
 
+  const {
+    processIdentity: _storedProcessIdentity,
+    ownershipSnapshot: _storedOwnershipSnapshot,
+    ownershipCaptureFailed: _storedOwnershipCaptureFailed,
+    ...storedTask
+  } = storedJob;
+  let workerOwnership;
+  try {
+    const processIdentity = (dependencies.getProcessIdentityImpl ?? getProcessIdentity)(process.pid);
+    workerOwnership = processIdentity ? { processIdentity } : { ownershipCaptureFailed: true };
+  } catch {
+    workerOwnership = { ownershipCaptureFailed: true };
+  }
+
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
@@ -874,18 +875,19 @@ async function handleTaskWorker(argv) {
 
   const { logFile, progress } = createTrackedProgress(
     {
-      ...storedJob,
+      ...storedTask,
       workspaceRoot
     },
     {
       logFile: storedJob.logFile ?? null
     }
   );
-  await runTrackedJob(
+  await (dependencies.runTrackedJobImpl ?? runTrackedJob)(
     {
-      ...storedJob,
+      ...storedTask,
       workspaceRoot,
-      logFile
+      logFile,
+      ...workerOwnership
     },
     () =>
       executeTaskRun({
@@ -976,6 +978,43 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+function finishCancelledJob(workspaceRoot, record, interrupt, options) {
+  appendLogLine(record.logFile, "Cancelled by user.");
+
+  const completedAt = nowIso();
+  const nextJob = {
+    ...record,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    completedAt,
+    errorMessage: "Cancelled by user."
+  };
+
+  writeJobFile(workspaceRoot, record.id, {
+    ...nextJob,
+    cancelledAt: completedAt
+  });
+  upsertJob(workspaceRoot, {
+    id: record.id,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    errorMessage: "Cancelled by user.",
+    completedAt
+  });
+
+  const payload = {
+    jobId: record.id,
+    status: "cancelled",
+    title: record.title,
+    turnInterruptAttempted: interrupt.attempted,
+    turnInterrupted: interrupt.interrupted
+  };
+
+  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+}
+
 export async function handleCancel(argv, dependencies = {}) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -985,90 +1024,71 @@ export async function handleCancel(argv, dependencies = {}) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  let existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  let record = { ...job, ...existing };
+
+  if (!Number.isFinite(record.pid)) {
+    writeCancelFlag(workspaceRoot, job.id);
+    existing = readStoredJob(workspaceRoot, job.id) ?? existing;
+    record = { ...job, ...existing };
+    if (!Number.isFinite(record.pid)) {
+      finishCancelledJob(
+        workspaceRoot,
+        record,
+        { attempted: false, interrupted: false },
+        options
+      );
+      return;
+    }
+  }
+
+  const threadId = record.threadId ?? null;
+  const turnId = record.turnId ?? null;
 
   const interrupt = await (dependencies.interruptAppServerTurnImpl ?? interruptAppServerTurn)(cwd, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
-      job.logFile,
+      record.logFile,
       interrupt.interrupted
         ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
         : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
     );
   }
 
-  const expectedRootIdentity = existing.processIdentity ?? job.processIdentity ?? null;
-  const ownershipSnapshot = existing.ownershipSnapshot ?? job.ownershipSnapshot ?? null;
-  const ownershipCaptureFailed =
-    existing.ownershipCaptureFailed === true || job.ownershipCaptureFailed === true;
-  const cleanupOutcome = await (dependencies.terminateProcessTreeImpl ?? terminateProcessTree)(job.pid ?? Number.NaN, {
+  const expectedRootIdentity = existing.processIdentity ?? null;
+  const ownershipCaptureFailed = existing.ownershipCaptureFailed === true;
+  const cleanupOutcome = await (dependencies.terminateProcessTreeImpl ?? terminateProcessTree)(record.pid, {
     expectedRootIdentity,
-    ownershipSnapshot,
+    ownershipSnapshot: null,
     requireVerifiedOwnership: ownershipCaptureFailed
   });
   if (cleanupOutcome?.verified !== true) {
     const failureMessage =
-      ownershipCaptureFailed && !expectedRootIdentity && !ownershipSnapshot?.rootIdentity
+      ownershipCaptureFailed && !expectedRootIdentity
         ? `Job ${job.id} could not be verified as owned and was left alone.`
         : `Unable to verify cleanup for ${job.id}; ownership records were preserved for retry.`;
-    appendLogLine(job.logFile, failureMessage);
+    appendLogLine(record.logFile, failureMessage);
     const recoveryRecord = {
-      ...existing,
-      ...job,
-      status: job.status,
+      ...record,
+      status: record.status,
       phase: "cleanup-pending",
-      pid: job.pid ?? existing.pid ?? null,
+      pid: record.pid,
       cleanupOutcome,
       cleanupFailure: failureMessage
     };
     writeJobFile(workspaceRoot, job.id, recoveryRecord);
     upsertJob(workspaceRoot, {
       id: job.id,
-      status: job.status,
+      status: record.status,
       phase: "cleanup-pending",
-      pid: job.pid ?? existing.pid ?? null,
+      pid: record.pid,
       cleanupOutcome,
       cleanupFailure: failureMessage
     });
     throw new Error(failureMessage);
   }
-  appendLogLine(job.logFile, "Cancelled by user.");
 
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
-
-  const payload = {
-    jobId: job.id,
-    status: "cancelled",
-    title: job.title,
-    turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
-  };
-
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  finishCancelledJob(workspaceRoot, record, interrupt, options);
 }
 
 async function main() {

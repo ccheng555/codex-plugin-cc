@@ -14,7 +14,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState, writeJobFile } from "./lib/state.mjs";
+import { loadState, resolveStateFile, saveState, writeCancelFlag, writeJobFile } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -65,20 +65,23 @@ export async function cleanupSessionJobs(cwd, sessionId, dependencies = {}) {
     if (!stillRunning) {
       continue;
     }
+    if (job.status === "queued" && !Number.isFinite(job.pid)) {
+      writeCancelFlag(workspaceRoot, job.id);
+      continue;
+    }
     try {
       const expectedRootIdentity = job.processIdentity ?? null;
-      const ownershipSnapshot = job.ownershipSnapshot ?? null;
       const ownershipCaptureFailed = job.ownershipCaptureFailed === true;
       const outcome = await terminate(job.pid ?? Number.NaN, {
         expectedRootIdentity,
-        ownershipSnapshot,
+        ownershipSnapshot: null,
         requireVerifiedOwnership: ownershipCaptureFailed
       });
       if (outcome?.verified === true) {
         continue;
       }
       const cleanupFailure =
-        ownershipCaptureFailed && !expectedRootIdentity && !ownershipSnapshot?.rootIdentity
+        ownershipCaptureFailed && !expectedRootIdentity
           ? `Job ${job.id} could not be verified as owned and was left alone.`
           : "Session cleanup could not verify process termination.";
       const retainedJob = {
