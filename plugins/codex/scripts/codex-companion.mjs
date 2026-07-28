@@ -24,7 +24,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, captureProcessOwnership, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -686,11 +686,27 @@ function enqueueBackgroundTask(cwd, job, request) {
   appendLogLine(logFile, "Queued for background execution.");
 
   const child = spawnDetachedTaskWorker(cwd, job.id);
+  let ownershipSnapshot = null;
+  let ownershipCaptureFailed = false;
+  if (process.platform !== "win32") {
+    try {
+      ownershipSnapshot = captureProcessOwnership(child.pid ?? Number.NaN, {
+        cwd,
+        env: process.env
+      });
+      ownershipCaptureFailed = !ownershipSnapshot?.rootIdentity;
+    } catch {
+      ownershipCaptureFailed = true;
+    }
+  }
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
     pid: child.pid ?? null,
+    processIdentity: ownershipSnapshot?.rootIdentity ?? null,
+    ownershipSnapshot,
+    ownershipCaptureFailed,
     logFile,
     request
   };
@@ -983,12 +999,20 @@ export async function handleCancel(argv, dependencies = {}) {
     );
   }
 
+  const expectedRootIdentity = existing.processIdentity ?? job.processIdentity ?? null;
+  const ownershipSnapshot = existing.ownershipSnapshot ?? job.ownershipSnapshot ?? null;
+  const ownershipCaptureFailed =
+    existing.ownershipCaptureFailed === true || job.ownershipCaptureFailed === true;
   const cleanupOutcome = await (dependencies.terminateProcessTreeImpl ?? terminateProcessTree)(job.pid ?? Number.NaN, {
-    expectedRootIdentity: existing.processIdentity ?? job.processIdentity ?? null,
-    ownershipSnapshot: existing.ownershipSnapshot ?? job.ownershipSnapshot ?? null
+    expectedRootIdentity,
+    ownershipSnapshot,
+    requireVerifiedOwnership: ownershipCaptureFailed
   });
   if (cleanupOutcome?.verified !== true) {
-    const failureMessage = `Unable to verify cleanup for ${job.id}; ownership records were preserved for retry.`;
+    const failureMessage =
+      ownershipCaptureFailed && !expectedRootIdentity && !ownershipSnapshot?.rootIdentity
+        ? `Job ${job.id} could not be verified as owned and was left alone.`
+        : `Unable to verify cleanup for ${job.id}; ownership records were preserved for retry.`;
     appendLogLine(job.logFile, failureMessage);
     const recoveryRecord = {
       ...existing,

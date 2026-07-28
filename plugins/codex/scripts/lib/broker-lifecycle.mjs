@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { captureProcessOwnership } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -123,6 +124,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
+      pidIdentity: existing.pidIdentity ?? null,
+      ownershipSnapshot: existing.ownershipSnapshot ?? null,
+      requireVerifiedOwnership: existing.ownershipCaptureFailed === true,
       killProcess: options.killProcess ?? null
     });
     if (cleanup?.verified !== true) {
@@ -150,6 +154,21 @@ export async function ensureBrokerSession(cwd, options = {}) {
     logFile,
     env: options.env ?? process.env
   });
+  const captureOwnership = options.captureProcessOwnershipImpl ?? captureProcessOwnership;
+  let ownershipSnapshot = null;
+  let ownershipCaptureFailed = false;
+  if ((options.platform ?? process.platform) !== "win32") {
+    try {
+      ownershipSnapshot = captureOwnership(child.pid ?? Number.NaN, {
+        cwd,
+        env: options.env ?? process.env,
+        platform: options.platform
+      });
+      ownershipCaptureFailed = !ownershipSnapshot?.rootIdentity;
+    } catch {
+      ownershipCaptureFailed = true;
+    }
+  }
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
@@ -159,6 +178,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile,
       sessionDir,
       pid: child.pid ?? null,
+      pidIdentity: ownershipSnapshot?.rootIdentity ?? null,
+      ownershipSnapshot,
+      requireVerifiedOwnership: ownershipCaptureFailed,
       killProcess: options.killProcess ?? null
     });
     if (cleanup?.verified !== true) {
@@ -172,7 +194,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    pidIdentity: ownershipSnapshot?.rootIdentity ?? null,
+    ownershipSnapshot,
+    ownershipCaptureFailed
   };
   saveBrokerSession(cwd, session);
   return session;
@@ -186,6 +211,7 @@ export async function teardownBrokerSession({
   pid = null,
   pidIdentity = null,
   ownershipSnapshot = null,
+  requireVerifiedOwnership = false,
   killProcess = null
 }) {
   let cleanupOutcome = {
@@ -203,7 +229,8 @@ export async function teardownBrokerSession({
     try {
       const outcome = await killProcess(pid, {
         expectedRootIdentity: pidIdentity,
-        ownershipSnapshot
+        ownershipSnapshot,
+        requireVerifiedOwnership
       });
       cleanupOutcome = outcome ?? {
         ...cleanupOutcome,

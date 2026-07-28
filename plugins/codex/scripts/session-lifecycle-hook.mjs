@@ -66,18 +66,26 @@ export async function cleanupSessionJobs(cwd, sessionId, dependencies = {}) {
       continue;
     }
     try {
+      const expectedRootIdentity = job.processIdentity ?? null;
+      const ownershipSnapshot = job.ownershipSnapshot ?? null;
+      const ownershipCaptureFailed = job.ownershipCaptureFailed === true;
       const outcome = await terminate(job.pid ?? Number.NaN, {
-        expectedRootIdentity: job.processIdentity ?? null,
-        ownershipSnapshot: job.ownershipSnapshot ?? null
+        expectedRootIdentity,
+        ownershipSnapshot,
+        requireVerifiedOwnership: ownershipCaptureFailed
       });
       if (outcome?.verified === true) {
         continue;
       }
+      const cleanupFailure =
+        ownershipCaptureFailed && !expectedRootIdentity && !ownershipSnapshot?.rootIdentity
+          ? `Job ${job.id} could not be verified as owned and was left alone.`
+          : "Session cleanup could not verify process termination.";
       const retainedJob = {
         ...job,
         phase: "cleanup-pending",
         cleanupOutcome: outcome,
-        cleanupFailure: "Session cleanup could not verify process termination."
+        cleanupFailure
       };
       writeJobFile(workspaceRoot, job.id, retainedJob);
       retainedJobs.push(retainedJob);
@@ -136,6 +144,9 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const pidIdentity = brokerSession?.pidIdentity ?? null;
+  const ownershipSnapshot = brokerSession?.ownershipSnapshot ?? null;
+  const requireVerifiedOwnership = brokerSession?.ownershipCaptureFailed === true;
 
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
@@ -148,6 +159,9 @@ async function handleSessionEnd(input) {
     logFile,
     sessionDir,
     pid,
+    pidIdentity,
+    ownershipSnapshot,
+    requireVerifiedOwnership,
     killProcess: terminateProcessTree
   });
   if (brokerCleanup?.verified === true) {

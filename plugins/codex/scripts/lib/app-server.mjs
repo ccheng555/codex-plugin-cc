@@ -278,7 +278,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
             void terminateProcessTree(this.proc.pid, {
               expectedRootIdentity: this.procIdentity,
               ownershipSnapshot: this.ownershipSnapshot,
-              requireVerifiedOwnership: this.identityCaptureFailed
+              requireVerifiedOwnership: this.identityCaptureFailed,
+              ownerHoldsLiveHandle: true
             })
               .then((outcome) => {
                 this.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
@@ -296,6 +297,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
           expectedRootIdentity: this.procIdentity,
           ownershipSnapshot: this.ownershipSnapshot,
           requireVerifiedOwnership: this.identityCaptureFailed,
+          ownerHoldsLiveHandle: true,
           directKillImpl: (signal) => this.proc.kill(signal),
           warnImpl: () => {}
         });

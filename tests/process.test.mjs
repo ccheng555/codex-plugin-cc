@@ -80,6 +80,7 @@ test("terminateProcessTree terminates Unix descendant groups deepest-first", asy
   const parents = new Map([[1234, 1], [1235, 1234], [1236, 1235], [1237, 1234]]);
   const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
+    expectedRootIdentity: "1234@Mon Jul 27 00:00:00 2026",
     runCommandImpl(command, args) {
       assert.equal(command, "/bin/ps");
       assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
@@ -118,6 +119,7 @@ test("terminateProcessTree signals a Unix PID directly when it is not a group le
   let alive = true;
   const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
+    expectedRootIdentity: "1234@Mon Jul 27 00:00:00 2026",
     runCommandImpl(command, args) {
       return {
         command,
@@ -150,6 +152,7 @@ test("terminateProcessTree parses a captured Linux procps process table", async 
   ].join("\n");
   const outcome = await terminateProcessTree(42001, {
     platform: "linux",
+    expectedRootIdentity: "42001@Mon Jul 27 12:34:56 2026",
     runCommandImpl(command, args) {
       assert.equal(command, "/bin/ps");
       assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
@@ -183,6 +186,7 @@ test("terminateProcessTree falls back to a direct child kill when Unix process e
   const warnings = [];
   const outcome = await terminateProcessTree(1234, {
     platform: "darwin",
+    expectedRootIdentity: "1234@Mon Jul 27 00:00:00 2026",
     warnImpl(message) {
       warnings.push(message);
     },
@@ -287,6 +291,113 @@ test("terminateProcessTree refuses a reused root PID", async () => {
   assert.deepEqual(cleanOutcome.survivorIdentities, []);
 });
 
+test("terminateProcessTree refuses a PID without persisted ownership", async () => {
+  const signals = [];
+  const outcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    runCommandImpl() {
+      return {
+        command: "/bin/ps",
+        args: [],
+        status: 0,
+        signal: null,
+        stdout: "1234 1 1234 S Mon Jul 27 00:00:00 2026\n",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(signals, []);
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+  assert.deepEqual(outcome.survivors, [1234]);
+  assert.deepEqual(outcome.survivorIdentities, []);
+});
+
+test("terminateProcessTree refuses capture-failure cleanup without a live owner handle", async () => {
+  const identityObservedAtSpawn = "1234@Sun Jul 26 00:00:00 2026";
+  const identityNowHoldingPid = "1234@Mon Jul 27 00:00:00 2026";
+  const persistedRecord = {
+    ownershipCaptureFailed: true,
+    processIdentity: null,
+    ownershipSnapshot: null
+  };
+  const signals = [];
+  const outcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    expectedRootIdentity: persistedRecord.processIdentity,
+    ownershipSnapshot: persistedRecord.ownershipSnapshot,
+    requireVerifiedOwnership: persistedRecord.ownershipCaptureFailed,
+    runCommandImpl() {
+      return {
+        command: "/bin/ps",
+        args: [],
+        status: 0,
+        signal: null,
+        stdout: `1234 1 1234 S ${identityNowHoldingPid.slice(identityNowHoldingPid.indexOf("@") + 1)}\n`,
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+    }
+  });
+
+  assert.notEqual(identityNowHoldingPid, identityObservedAtSpawn);
+  assert.deepEqual(signals, []);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+});
+
+test("terminateProcessTree permits capture-failure cleanup with a live owner handle", async () => {
+  const identityObservedAtSpawn = "1234@Sun Jul 26 00:00:00 2026";
+  const identityNowHoldingPid = "1234@Mon Jul 27 00:00:00 2026";
+  const persistedRecord = {
+    ownershipCaptureFailed: true,
+    processIdentity: null,
+    ownershipSnapshot: null
+  };
+  const signals = [];
+  let alive = true;
+  const outcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    expectedRootIdentity: persistedRecord.processIdentity,
+    ownershipSnapshot: persistedRecord.ownershipSnapshot,
+    requireVerifiedOwnership: persistedRecord.ownershipCaptureFailed,
+    ownerHoldsLiveHandle: true,
+    pollIntervalMs: 0,
+    runCommandImpl() {
+      return {
+        command: "/bin/ps",
+        args: [],
+        status: 0,
+        signal: null,
+        stdout: alive
+          ? `1234 1 1234 S ${identityNowHoldingPid.slice(identityNowHoldingPid.indexOf("@") + 1)}\n`
+          : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+      alive = false;
+    }
+  });
+
+  assert.notEqual(identityNowHoldingPid, identityObservedAtSpawn);
+  assert.deepEqual(signals, [[-1234, "SIGTERM"]]);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+});
+
 test("terminateProcessTree revalidates descendant identities before signaling", async () => {
   const signals = [];
   let rootAlive = true;
@@ -378,6 +489,7 @@ test("terminateProcessTree keeps the root alive until its descendants are reaped
   const alive = new Set([100, 200]);
   const outcome = await terminateProcessTree(100, {
     platform: "darwin",
+    expectedRootIdentity: "100@Mon Jul 27 00:00:00 2026",
     pollIntervalMs: 0,
     runCommandImpl(command, args) {
       const rows = [];
@@ -423,6 +535,7 @@ test("terminateProcessTree tracks reparented members of a signaled process group
     const alive = new Set([100, 200]);
     const outcome = await terminateProcessTree(100, {
       platform: "darwin",
+      expectedRootIdentity: "100@Mon Jul 27 00:00:00 2026",
       termPollAttempts: 1,
       killPollAttempts: 1,
       sleepImpl() {},
@@ -545,5 +658,103 @@ test("terminateProcessGroup hunts an observed regrouped helper after its root ex
   assert.deepEqual(signals, [[-200, "SIGTERM"]]);
   assert.equal(outcome.verified, false);
   assert.equal(outcome.degraded, true);
+  assert.deepEqual(outcome.survivors, []);
+});
+
+test("terminateProcessGroup excludes a reused snapshot PID", async () => {
+  const signals = [];
+  const ownershipSnapshot = {
+    rootPid: 100,
+    rootIdentity: "100@Mon Jul 27 00:00:00 2026",
+    processGroupId: 100,
+    members: [
+      {
+        pid: 100,
+        parentPid: 1,
+        processGroupId: 100,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "100@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      },
+      {
+        pid: 200,
+        parentPid: 100,
+        processGroupId: 100,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:01 2026",
+        identity: "200@Mon Jul 27 00:00:01 2026",
+        depth: 1
+      }
+    ]
+  };
+  const outcome = await terminateProcessGroup(100, {
+    platform: "darwin",
+    ownershipSnapshot,
+    pollIntervalMs: 0,
+    runCommandImpl() {
+      return {
+        command: "/bin/ps",
+        args: [],
+        status: 0,
+        signal: null,
+        stdout: "200 1 100 S Mon Jul 27 00:01:01 2026\n",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(signals, []);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+});
+
+test("terminateProcessGroup reclaims a post-snapshot member of the owned group", async () => {
+  const signals = [];
+  let alive = true;
+  const ownershipSnapshot = {
+    rootPid: 100,
+    rootIdentity: "100@Mon Jul 27 00:00:00 2026",
+    processGroupId: 100,
+    members: [
+      {
+        pid: 100,
+        parentPid: 1,
+        processGroupId: 100,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "100@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      }
+    ]
+  };
+  const outcome = await terminateProcessGroup(100, {
+    platform: "darwin",
+    ownershipSnapshot,
+    pollIntervalMs: 0,
+    runCommandImpl() {
+      return {
+        command: "/bin/ps",
+        args: [],
+        status: 0,
+        signal: null,
+        stdout: alive ? "300 1 100 S Mon Jul 27 00:00:02 2026\n" : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+      alive = false;
+    }
+  });
+
+  assert.deepEqual(signals, [[300, "SIGTERM"]]);
+  assert.equal(outcome.verified, true);
+  assert.equal(outcome.degraded, false);
   assert.deepEqual(outcome.survivors, []);
 });

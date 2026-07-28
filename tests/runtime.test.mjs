@@ -111,6 +111,83 @@ test("fake app-server crash reclaims an observed regrouped helper without replac
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
 });
 
+test("shared broker reclaims a post-snapshot helper before allowing replacement", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "crash-with-post-snapshot-helper");
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "1000"
+  };
+  const brokerSession = await ensureBrokerSession(repo, { env });
+  if (!brokerSession) {
+    t.skip("broker socket unavailable in this sandbox");
+    return;
+  }
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+    if (fs.existsSync(fakeStatePath)) {
+      const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+      for (const helperPid of state.helperPids || []) {
+        try {
+          process.kill(helperPid, "SIGKILL");
+        } catch {
+          // Ignore helpers already terminated by group cleanup.
+        }
+      }
+    }
+  });
+
+  function isLive(pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code !== "ESRCH";
+    }
+  }
+
+  const client = await CodexAppServerClient.connect(repo, { env });
+  await client.request("thread/list", { cwd: repo });
+  await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) {
+      return false;
+    }
+    const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    return state.helperPids?.length === 1 && state.appServerPids?.length === 1;
+  });
+
+  const firstState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const appServerPid = firstState.appServerPids[0];
+  const helperPid = firstState.helperPids[0];
+  await waitFor(() => !isLive(appServerPid));
+  await waitFor(() => !isLive(helperPid));
+
+  const replacementResponse = await waitFor(async () => {
+    try {
+      const replacementClient = await CodexAppServerClient.connect(repo, { env });
+      try {
+        return await replacementClient.request("thread/list", { cwd: repo });
+      } finally {
+        await replacementClient.close();
+      }
+    } catch (error) {
+      if (error?.rpcCode === -32002) {
+        return false;
+      }
+      throw error;
+    }
+  });
+
+  assert.ok(Array.isArray(replacementResponse.data));
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 2);
+});
+
 test("broker shutdown completes without starting a second app-server", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1770,6 +1847,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     stdio: "ignore"
   });
   sleeper.unref();
+  const ownershipSnapshot = captureProcessOwnership(sleeper.pid, { cwd: workspace });
 
   t.after(() => {
     try {
@@ -1793,6 +1871,9 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
         id: "task-live",
         status: "running",
         title: "Codex Task",
+        pid: sleeper.pid,
+        processIdentity: ownershipSnapshot.rootIdentity,
+        ownershipSnapshot,
         logFile
       },
       null,
@@ -1814,6 +1895,8 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
             jobClass: "task",
             summary: "Investigate flaky test",
             pid: sleeper.pid,
+            processIdentity: ownershipSnapshot.rootIdentity,
+            ownershipSnapshot,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -2124,7 +2207,21 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     stdio: "ignore"
   });
   sleeper.unref();
-  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  const ownershipSnapshot = captureProcessOwnership(sleeper.pid, { cwd: repo });
+  fs.writeFileSync(
+    runningJobFile,
+    JSON.stringify(
+      {
+        id: "review-running",
+        pid: sleeper.pid,
+        processIdentity: ownershipSnapshot.rootIdentity,
+        ownershipSnapshot
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
 
   t.after(() => {
     try {
@@ -2160,6 +2257,8 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
             title: "Codex Review",
             sessionId: "sess-current",
             pid: sleeper.pid,
+            processIdentity: ownershipSnapshot.rootIdentity,
+            ownershipSnapshot,
             logFile: runningLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"

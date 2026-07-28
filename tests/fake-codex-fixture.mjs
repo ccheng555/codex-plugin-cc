@@ -273,18 +273,20 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
-if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-child" || BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "with-resistant-helper") {
-  const helperCode = BEHAVIOR === "with-resistant-helper"
-    ? "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
-    : "setInterval(() => {}, 1000)";
-  const helper = spawn(process.execPath, ["-e", helperCode], {
-    detached: process.platform !== "win32",
-    stdio: "ignore"
-  });
-  helper.unref();
-  bootState.helperPids = [...(bootState.helperPids || []), helper.pid];
+if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-child" || BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "with-resistant-helper" || BEHAVIOR === "crash-with-post-snapshot-helper") {
+  if (BEHAVIOR !== "crash-with-post-snapshot-helper") {
+    const helperCode = BEHAVIOR === "with-resistant-helper"
+      ? "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
+      : "setInterval(() => {}, 1000)";
+    const helper = spawn(process.execPath, ["-e", helperCode], {
+      detached: process.platform !== "win32",
+      stdio: "ignore"
+    });
+    helper.unref();
+    bootState.helperPids = [...(bootState.helperPids || []), helper.pid];
+  }
 }
-if (BEHAVIOR === "crash-with-regrouped-helper") {
+if (BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "crash-with-post-snapshot-helper") {
   bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 }
 saveState(bootState);
@@ -306,6 +308,19 @@ rl.on("line", (line) => {
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         if (BEHAVIOR === "crash-with-regrouped-helper") {
           setTimeout(() => process.exit(1), 100);
+        }
+        if (BEHAVIOR === "crash-with-post-snapshot-helper") {
+          setTimeout(() => {
+            const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+              detached: false,
+              stdio: "ignore"
+            });
+            helper.unref();
+            const current = loadState();
+            current.helperPids = [...(current.helperPids || []), helper.pid];
+            saveState(current);
+            setTimeout(() => process.exit(1), 100);
+          }, 250);
         }
         break;
 
