@@ -785,3 +785,51 @@ test("terminateProcessGroup reclaims a post-snapshot member of the owned group",
   assert.equal(outcome.degraded, false);
   assert.deepEqual(outcome.survivors, []);
 });
+
+test("terminateProcessGroup signals nothing when the group id was reused by another leader", async () => {
+  const signals = [];
+  const ownershipSnapshot = {
+    rootPid: 100,
+    rootIdentity: "100@Mon Jul 27 00:00:00 2026",
+    processGroupId: 100,
+    members: [
+      {
+        pid: 100,
+        parentPid: 1,
+        processGroupId: 100,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "100@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      }
+    ]
+  };
+  // pid 100 now belongs to an unrelated process that leads its own group, and
+  // pid 301 is a member of that stranger's group. 301 is absent from the
+  // snapshot, so the per-record check cannot exclude it.
+  const outcome = await terminateProcessGroup(100, {
+    platform: "darwin",
+    ownershipSnapshot,
+    pollIntervalMs: 0,
+    runCommandImpl() {
+      return {
+        command: "/bin/ps",
+        args: [],
+        status: 0,
+        signal: null,
+        stdout:
+          "100 1 100 S Tue Jul 28 09:00:00 2026\n301 100 100 S Tue Jul 28 09:00:01 2026\n",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(signals, []);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+  assert.deepEqual(outcome.survivors, [100]);
+});

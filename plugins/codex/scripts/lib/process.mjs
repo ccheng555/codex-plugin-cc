@@ -645,6 +645,26 @@ export async function terminateProcessGroup(pgid, options = {}) {
   const tracked = new Map();
   const ownershipSnapshot = options.ownershipSnapshot ?? null;
   const ownershipEstablished = Boolean(ownershipSnapshot);
+  // If a live process holds this group id but is not the root we recorded, the
+  // id has been reused and nothing in the group is ours. Refuse before
+  // admitting any member: members of an unrelated group are absent from the
+  // snapshot, so the per-record check below would admit them, and the leader
+  // identity check runs only after signals have already been delivered.
+  // A missing leader is not a mismatch — that is the crashed-root case where
+  // surviving helpers still need reclaiming.
+  const groupLeader = processes.get(pgid);
+  if (ownershipSnapshot && groupLeader && groupLeader.identity !== ownershipSnapshot.rootIdentity) {
+    return normalizeProcessCleanupOutcome({
+      attempted: false,
+      delivered: false,
+      verified: false,
+      degraded: true,
+      identityMismatch: true,
+      method: "process-group",
+      survivors: recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.pid),
+      survivorIdentities: recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.identity)
+    });
+  }
   for (const record of recordsFromOwnershipSnapshot(ownershipSnapshot)) {
     tracked.set(record.identity, record);
   }
