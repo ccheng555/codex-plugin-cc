@@ -15,6 +15,8 @@ const readline = require("node:readline");
 
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
+	const DETACHED_FIXTURE_TTL_MS = 5 * 60 * 1000;
+	const SELF_EXPIRING_KEEPALIVE = "setTimeout(() => process.exit(0), " + DETACHED_FIXTURE_TTL_MS + "); setInterval(() => {}, 1000)";
 	const interruptibleTurns = new Map();
 	const { spawn } = require("node:child_process");
 
@@ -276,8 +278,8 @@ bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-child" || BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "with-resistant-helper" || BEHAVIOR === "crash-with-post-snapshot-helper") {
   if (BEHAVIOR !== "crash-with-post-snapshot-helper") {
     const helperCode = BEHAVIOR === "with-resistant-helper"
-      ? "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
-      : "setInterval(() => {}, 1000)";
+      ? "process.on('SIGTERM', () => {}); " + SELF_EXPIRING_KEEPALIVE
+      : SELF_EXPIRING_KEEPALIVE;
     const helper = spawn(process.execPath, ["-e", helperCode], {
       detached: process.platform !== "win32",
       stdio: "ignore"
@@ -311,7 +313,7 @@ rl.on("line", (line) => {
         }
         if (BEHAVIOR === "crash-with-post-snapshot-helper") {
           setTimeout(() => {
-            const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+            const helper = spawn(process.execPath, ["-e", SELF_EXPIRING_KEEPALIVE], {
               detached: false,
               stdio: "ignore"
             });

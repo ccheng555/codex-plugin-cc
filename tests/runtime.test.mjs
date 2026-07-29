@@ -22,6 +22,8 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const DETACHED_FIXTURE_TTL_MS = 5 * 60 * 1000;
+const SELF_EXPIRING_KEEPALIVE = selfExpiringKeepaliveCode();
 const runtimeTempDirs = new Set();
 const runtimePluginDataDir = createTempDir("codex-plugin-runtime-state-");
 process.env.CLAUDE_PLUGIN_DATA = runtimePluginDataDir;
@@ -30,6 +32,10 @@ function makeTempDir(prefix) {
   const tempDir = createTempDir(prefix);
   runtimeTempDirs.add(tempDir);
   return tempDir;
+}
+
+function selfExpiringKeepaliveCode(ttlMs = DETACHED_FIXTURE_TTL_MS) {
+  return `setTimeout(() => process.exit(0), ${ttlMs}); setInterval(() => {}, 1000)`;
 }
 
 test.after(() => {
@@ -56,6 +62,29 @@ test("broker rejects queued work after shutdown begins", () => {
   assert.equal(isBrokerRequestAllowedDuringShutdown(true, { id: 2, method: "thread/list" }), false);
   assert.equal(isBrokerRequestAllowedDuringShutdown(true, { id: 3, method: "broker/shutdown" }), true);
   assert.equal(isBrokerRequestAllowedDuringShutdown(false, { id: 4, method: "thread/list" }), true);
+});
+
+test("detached fixture keepalive self-expires when parent cleanup is skipped", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix detached fixture behavior is not available on Windows.");
+    return;
+  }
+
+  const sleeper = spawn(process.execPath, ["-e", selfExpiringKeepaliveCode(500)], {
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+  assert.doesNotThrow(() => process.kill(sleeper.pid, 0));
+
+  await waitFor(() => {
+    try {
+      process.kill(sleeper.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  }, { timeoutMs: 3000 });
 });
 
 test("background task is persisted before its worker can start", () => {
@@ -2063,7 +2092,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const sleeper = spawn(process.execPath, ["-e", SELF_EXPIRING_KEEPALIVE], {
     cwd: workspace,
     detached: true,
     stdio: "ignore"
@@ -2342,13 +2371,13 @@ test("cancel reclaims a helper spawned after worker identity capture without an 
         const fs = require("node:fs");
         const { spawn } = require("node:child_process");
         setTimeout(() => {
-          const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          const helper = spawn(process.execPath, ["-e", ${JSON.stringify(SELF_EXPIRING_KEEPALIVE)}], {
             stdio: "ignore"
           });
           helper.unref();
           fs.writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
         }, 750);
-        setInterval(() => {}, 1000);
+        ${SELF_EXPIRING_KEEPALIVE};
       `
     ],
     {
@@ -2765,7 +2794,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
   fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const sleeper = spawn(process.execPath, ["-e", SELF_EXPIRING_KEEPALIVE], {
     cwd: repo,
     detached: true,
     stdio: "ignore"
