@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { captureProcessOwnership, normalizeProcessCleanupOutcome, terminateProcessTree } from "./process.mjs";
+import { captureProcessOwnership, normalizeProcessCleanupOutcome, terminateProcessGroup, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -221,6 +221,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
           : createProtocolError(
               `codex app-server exited unexpectedly (${signal ? `signal ${signal}` : `exit ${code}`}).${stderr ? `\n${stderr}` : ""}`
             );
+      if (!this.closed) {
+        this.startUnexpectedExitCleanup(this.proc.pid);
+      }
       this.handleExit(detail);
     });
 
@@ -252,6 +255,51 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       throw new Error("Unable to capture codex app-server process identity.");
     }
     this.notify("initialized", {});
+  }
+
+  startUnexpectedExitCleanup(pid) {
+    if (
+      this.unexpectedExitCleanupPromise ||
+      process.platform === "win32" ||
+      !Number.isFinite(pid) ||
+      !this.ownershipSnapshot?.rootIdentity
+    ) {
+      return this.unexpectedExitCleanupPromise ?? null;
+    }
+
+    this.unexpectedExitCleanupPromise = terminateProcessGroup(pid, {
+      ownershipSnapshot: this.ownershipSnapshot,
+      cwd: this.cwd,
+      env: this.options.env ?? process.env,
+      warnImpl: () => {}
+    })
+      .then((outcome) => {
+        this.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
+        if (!outcome.verified) {
+          process.stderr.write(
+            `Warning: unable to verify crashed codex app-server group cleanup; surviving PIDs: ${outcome.survivors?.join(", ") || "none known"}.\n`
+          );
+        }
+        return this.cleanupOutcome;
+      })
+      .catch((error) => {
+        this.cleanupOutcome = normalizeProcessCleanupOutcome({
+          attempted: true,
+          delivered: false,
+          verified: false,
+          degraded: true,
+          method: "process-group",
+          survivors: [],
+          survivorIdentities: []
+        });
+        process.stderr.write(`Warning: crashed codex app-server group cleanup failed: ${error.message}.\n`);
+        return this.cleanupOutcome;
+      });
+    return this.unexpectedExitCleanupPromise;
+  }
+
+  waitForUnexpectedExitCleanup() {
+    return this.unexpectedExitCleanupPromise ?? null;
   }
 
   async close() {
@@ -293,19 +341,23 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       } else {
         // The app-server is its own process-group leader on Unix. Terminate
         // the group so MCP helpers cannot outlive the app-server parent.
-        const outcome = await terminateProcessTree(this.proc.pid, {
-          expectedRootIdentity: this.procIdentity,
-          ownershipSnapshot: this.ownershipSnapshot,
-          requireVerifiedOwnership: this.identityCaptureFailed,
-          ownerHoldsLiveHandle: true,
-          directKillImpl: (signal) => this.proc.kill(signal),
-          warnImpl: () => {}
-        });
-        this.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
-        if (!outcome.verified) {
-          process.stderr.write(
-            `Warning: unable to verify codex app-server cleanup; surviving PIDs: ${outcome.survivors?.join(", ") || "none known"}.\n`
-          );
+        if (this.unexpectedExitCleanupPromise) {
+          await this.unexpectedExitCleanupPromise;
+        } else {
+          const outcome = await terminateProcessTree(this.proc.pid, {
+            expectedRootIdentity: this.procIdentity,
+            ownershipSnapshot: this.ownershipSnapshot,
+            requireVerifiedOwnership: this.identityCaptureFailed,
+            ownerHoldsLiveHandle: true,
+            directKillImpl: (signal) => this.proc.kill(signal),
+            warnImpl: () => {}
+          });
+          this.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
+          if (!outcome.verified) {
+            process.stderr.write(
+              `Warning: unable to verify codex app-server cleanup; surviving PIDs: ${outcome.survivors?.join(", ") || "none known"}.\n`
+            );
+          }
         }
       }
     }

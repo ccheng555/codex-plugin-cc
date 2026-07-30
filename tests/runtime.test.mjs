@@ -146,6 +146,96 @@ test("background task is persisted before its worker can start", () => {
   assert.equal(indexedJob.progressMarker, workerProgress.progressMarker);
 });
 
+test("background task marks the queued record failed when worker spawn throws", () => {
+  const workspace = makeTempDir();
+  const job = {
+    id: "task-sync-spawn-failure",
+    workspaceRoot: workspace,
+    kind: "task",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Exercise synchronous spawn failure",
+    createdAt: "2026-07-30T03:00:00.000Z"
+  };
+  const request = {
+    cwd: workspace,
+    prompt: "Exercise synchronous spawn failure",
+    jobId: job.id
+  };
+  const spawnError = Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" });
+
+  assert.throws(
+    () =>
+      enqueueBackgroundTask(workspace, job, request, {
+        spawnDetachedTaskWorkerImpl() {
+          throw spawnError;
+        }
+      }),
+    spawnError
+  );
+
+  const storedJob = readStoredJob(workspace, job.id);
+  assert.equal(storedJob.status, "failed");
+  assert.equal(storedJob.phase, "failed");
+  assert.equal(storedJob.pid, null);
+  assert.equal(storedJob.errorMessage, "spawn EAGAIN");
+  assert.ok(storedJob.completedAt);
+
+  const indexedJob = listJobs(workspace).find((candidate) => candidate.id === job.id);
+  assert.equal(indexedJob.status, "failed");
+  assert.equal(indexedJob.phase, "failed");
+  assert.equal(indexedJob.pid, null);
+  assert.equal(indexedJob.errorMessage, "spawn EAGAIN");
+});
+
+test("background task marks the queued record failed when worker emits a spawn error", () => {
+  const workspace = makeTempDir();
+  const job = {
+    id: "task-async-spawn-failure",
+    workspaceRoot: workspace,
+    kind: "task",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Exercise asynchronous spawn failure",
+    createdAt: "2026-07-30T03:01:00.000Z"
+  };
+  const request = {
+    cwd: workspace,
+    prompt: "Exercise asynchronous spawn failure",
+    jobId: job.id
+  };
+  let spawnErrorHandler = null;
+  const worker = {
+    once(event, handler) {
+      if (event === "error") {
+        spawnErrorHandler = handler;
+      }
+      return this;
+    }
+  };
+
+  enqueueBackgroundTask(workspace, job, request, {
+    spawnDetachedTaskWorkerImpl() {
+      return worker;
+    }
+  });
+  assert.equal(typeof spawnErrorHandler, "function");
+  spawnErrorHandler(Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" }));
+
+  const storedJob = readStoredJob(workspace, job.id);
+  assert.equal(storedJob.status, "failed");
+  assert.equal(storedJob.phase, "failed");
+  assert.equal(storedJob.pid, null);
+  assert.equal(storedJob.errorMessage, "spawn EMFILE");
+  assert.ok(storedJob.completedAt);
+
+  const indexedJob = listJobs(workspace).find((candidate) => candidate.id === job.id);
+  assert.equal(indexedJob.status, "failed");
+  assert.equal(indexedJob.phase, "failed");
+  assert.equal(indexedJob.pid, null);
+  assert.equal(indexedJob.errorMessage, "spawn EMFILE");
+});
+
 test("background task stays runnable when worker identity capture fails", async () => {
   const workspace = makeTempDir();
   const job = {
@@ -332,6 +422,52 @@ test("shared broker reclaims a post-snapshot helper before allowing replacement"
 
   assert.ok(Array.isArray(replacementResponse.data));
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 2);
+});
+
+test("direct app-server reclaims a post-snapshot helper after its child crashes", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process groups are not available on Windows.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "crash-with-post-snapshot-helper");
+  const env = buildEnv(binDir);
+  const client = await CodexAppServerClient.connect(repo, { env, disableBroker: true });
+  let helperPid = null;
+  t.after(async () => {
+    await client.close().catch(() => {});
+    if (Number.isFinite(helperPid)) {
+      try {
+        process.kill(helperPid, "SIGKILL");
+      } catch {
+        // Ignore a helper already reclaimed after the app-server crash.
+      }
+    }
+  });
+
+  await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) {
+      return false;
+    }
+    const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    if (state.helperPids?.length !== 1 || state.appServerPids?.length !== 1) {
+      return false;
+    }
+    helperPid = state.helperPids[0];
+    return true;
+  });
+  await client.waitForExit();
+  await waitFor(() => {
+    try {
+      process.kill(helperPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  }, { timeoutMs: 3000 });
 });
 
 test("broker shutdown completes without starting a second app-server", async (t) => {

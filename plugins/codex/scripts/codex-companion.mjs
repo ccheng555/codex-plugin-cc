@@ -682,6 +682,34 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
+function recordTaskWorkerSpawnFailure(workspaceRoot, jobId, error) {
+  const storedJob = readStoredJob(workspaceRoot, jobId);
+  if (!storedJob || storedJob.status !== "queued" || storedJob.pid != null) {
+    return;
+  }
+
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const completedAt = nowIso();
+  const failedRecord = {
+    ...storedJob,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt
+  };
+  writeJobFile(workspaceRoot, jobId, failedRecord);
+  upsertJob(workspaceRoot, {
+    id: jobId,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt
+  });
+  appendLogLine(storedJob.logFile, `Worker spawn failed: ${errorMessage}`);
+}
+
 export function enqueueBackgroundTask(cwd, job, request, dependencies = {}) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
@@ -698,7 +726,16 @@ export function enqueueBackgroundTask(cwd, job, request, dependencies = {}) {
   upsertJob(job.workspaceRoot, queuedRecord);
 
   const spawnWorker = dependencies.spawnDetachedTaskWorkerImpl ?? spawnDetachedTaskWorker;
-  spawnWorker(cwd, job.id);
+  let worker;
+  try {
+    worker = spawnWorker(cwd, job.id);
+  } catch (error) {
+    recordTaskWorkerSpawnFailure(job.workspaceRoot, job.id, error);
+    throw error;
+  }
+  worker?.once?.("error", (error) => {
+    recordTaskWorkerSpawnFailure(job.workspaceRoot, job.id, error);
+  });
 
   return {
     payload: {

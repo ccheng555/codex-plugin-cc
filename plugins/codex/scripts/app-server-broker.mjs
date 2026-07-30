@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { getLiveProcessPids, normalizeProcessCleanupOutcome, terminateProcessGroup } from "./lib/process.mjs";
+import { getLiveProcessPids } from "./lib/process.mjs";
 
 const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -284,12 +284,11 @@ async function main() {
             if (!client.closed && childPid != null && process.platform !== "win32") {
               // The child is a detached process-group leader; on an unexpected
               // exit its surviving helpers reparent away from the broker, so
-              // reclaim the group before allowing a replacement to spawn.
-              appClientClosePromise = terminateProcessGroup(childPid, {
-                ownershipSnapshot: client.ownershipSnapshot
-              })
-                .then((outcome) => {
-                  client.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
+              // wait for the client's shared direct/broker crash cleanup before
+              // allowing a replacement to spawn.
+              appClientClosePromise = client
+                .waitForUnexpectedExitCleanup()
+                ?.then(() => {
                   recordUnverifiedCleanup(client);
                 })
                 .catch((error) => {
@@ -298,7 +297,7 @@ async function main() {
                 })
                 .finally(() => {
                   appClientClosePromise = null;
-                });
+                }) ?? null;
             }
             scheduleChildIdleClose();
           });
