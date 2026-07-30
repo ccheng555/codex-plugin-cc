@@ -489,7 +489,7 @@ test("fake app-server crash reclaims an observed regrouped helper without replac
   await new Promise((resolve) => child.once("exit", resolve));
   const outcome = await terminateProcessGroup(child.pid, { ownershipSnapshot, env });
 
-  assert.equal(outcome.verified, false);
+  assert.equal(outcome.verified, true);
   assert.deepEqual(outcome.survivors, []);
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
 });
@@ -651,6 +651,22 @@ test("automatic broker registration preserves a shared broker until its final ow
       return error?.code === "ESRCH";
     }
   });
+});
+
+test("automatic broker creation stays disabled where registered ownership is unsupported", async () => {
+  const repo = makeTempDir();
+  let endpointFactoryCalled = false;
+  const session = await ensureBrokerSession(repo, {
+    platform: "win32",
+    createBrokerEndpoint() {
+      endpointFactoryCalled = true;
+      throw new Error("Windows automatic broker creation must stop before endpoint creation.");
+    }
+  });
+
+  assert.equal(session, null);
+  assert.equal(endpointFactoryCalled, false);
+  assert.equal(loadBrokerSession(repo), null);
 });
 
 test("direct app-server reclaims a post-snapshot helper after its child crashes", async (t) => {

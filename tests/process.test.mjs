@@ -821,6 +821,50 @@ test("terminateProcessGroup reclaims orphaned members of a dead leader's group",
   assert.deepEqual(outcome.targets, [202]);
 });
 
+test("terminateProcessGroup converges when an owned group is already absent", async () => {
+  const signals = [];
+  const ownershipSnapshot = {
+    rootPid: 200,
+    rootIdentity: "200@Mon Jul 27 00:00:00 2026",
+    processGroupId: 200,
+    members: [
+      {
+        pid: 200,
+        parentPid: 1,
+        processGroupId: 200,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "200@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      }
+    ]
+  };
+  const outcome = await terminateProcessGroup(200, {
+    platform: "darwin",
+    ownershipSnapshot,
+    pollIntervalMs: 0,
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(signals, []);
+  assert.equal(outcome.verified, true);
+  assert.equal(outcome.degraded, false);
+  assert.deepEqual(outcome.survivors, []);
+});
+
 test("terminateProcessGroup hunts an observed regrouped helper after its root exits", async () => {
   const signals = [];
   const alive = new Set([200]);
@@ -871,8 +915,8 @@ test("terminateProcessGroup hunts an observed regrouped helper after its root ex
   });
 
   assert.deepEqual(signals, [[-200, "SIGTERM"]]);
-  assert.equal(outcome.verified, false);
-  assert.equal(outcome.degraded, true);
+  assert.equal(outcome.verified, true);
+  assert.equal(outcome.degraded, false);
   assert.deepEqual(outcome.survivors, []);
 });
 

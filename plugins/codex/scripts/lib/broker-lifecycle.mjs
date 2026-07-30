@@ -113,6 +113,14 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  // Automatic brokers are detached and outlive the process that spawned them.
+  // Until Windows has a durable, reuse-resistant process identity for the
+  // registry, use the attached direct app-server lifecycle instead of
+  // publishing an unregistered broker that SessionEnd must refuse to signal.
+  if ((options.platform ?? process.platform) === "win32") {
+    return null;
+  }
+
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     if (existing.registry?.registered === true) {

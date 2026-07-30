@@ -707,11 +707,13 @@ export async function terminateProcessGroup(pgid, options = {}) {
   for (const record of recordsFromOwnershipSnapshot(ownershipSnapshot)) {
     tracked.set(record.identity, record);
   }
+  let groupMembersFound = false;
   let groupSelectionFound = false;
   for (const record of processes.values()) {
     if (record.processGroupId !== pgid || !isRunningProcess(record)) {
       continue;
     }
+    groupMembersFound = true;
     const snapshotRecord = recordsFromOwnershipSnapshot(ownershipSnapshot).find((candidate) => candidate.pid === record.pid);
     if (ownershipSnapshot && snapshotRecord && snapshotRecord.identity !== record.identity) {
       continue;
@@ -752,11 +754,12 @@ export async function terminateProcessGroup(pgid, options = {}) {
     }
     const root = processes.get(pgid);
     const rootIdentityMatches = !root || root.identity === ownershipSnapshot?.rootIdentity;
+    const ownedGroupAccountedFor = groupSelectionFound || !groupMembersFound;
     return normalizeProcessCleanupOutcome({
       attempted: true,
       delivered,
-      verified: live.length === 0 && (!ownershipEstablished || (rootIdentityMatches && groupSelectionFound)),
-      degraded: ownershipEstablished && (!rootIdentityMatches || !groupSelectionFound),
+      verified: live.length === 0 && (!ownershipEstablished || (rootIdentityMatches && ownedGroupAccountedFor)),
+      degraded: ownershipEstablished && (!rootIdentityMatches || !ownedGroupAccountedFor),
       escalated,
       method: "process-group",
       targets: [...tracked.values()].map((record) => record.pid),
