@@ -12,7 +12,7 @@ import { cleanupSessionJobs, handleSessionEnd, handleSessionStart } from "../plu
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { isBrokerRequestAllowedDuringShutdown } from "../plugins/codex/scripts/app-server-broker.mjs";
 import { SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
-import { ensureBrokerSession, loadBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { clearBrokerSession, ensureBrokerSession, loadBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
 import { captureProcessOwnership, getProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { hasCancelFlag, listJobs, loadState, resolveStateDir, saveState, upsertJob, writeCancelFlag, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
@@ -39,20 +39,32 @@ function selfExpiringKeepaliveCode(ttlMs = DETACHED_FIXTURE_TTL_MS) {
   return `setTimeout(() => process.exit(0), ${ttlMs}); setInterval(() => {}, 1000)`;
 }
 
-test.after(() => {
+test.after(async () => {
   const cleanupFailures = [];
 
   for (const cwd of [ROOT, ...runtimeTempDirs]) {
-    if (!loadBrokerSession(cwd)) {
+    const brokerSession = loadBrokerSession(cwd);
+    if (!brokerSession) {
       continue;
     }
 
-    const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
-      cwd,
-      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd })
+    await sendBrokerShutdown(brokerSession.endpoint).catch(() => {});
+    const cleanup = await teardownBrokerSession({
+      endpoint: brokerSession.endpoint,
+      pidFile: brokerSession.pidFile,
+      logFile: brokerSession.logFile,
+      sessionDir: brokerSession.sessionDir,
+      pid: brokerSession.pid,
+      pidIdentity: brokerSession.pidIdentity,
+      ownershipSnapshot: brokerSession.ownershipSnapshot,
+      requireVerifiedOwnership: brokerSession.ownershipCaptureFailed === true,
+      killProcess: terminateProcessTree
     });
-    if (cleanup.status !== 0 || loadBrokerSession(cwd)) {
-      cleanupFailures.push({ cwd, status: cleanup.status, stderr: cleanup.stderr });
+    if (cleanup?.verified === true) {
+      clearBrokerSession(cwd);
+    }
+    if (cleanup?.verified !== true || loadBrokerSession(cwd)) {
+      cleanupFailures.push({ cwd, cleanup });
     }
   }
 
@@ -165,6 +177,38 @@ test("SessionEnd leaves a shared broker untouched while another registered owner
   );
 
   assert.deepEqual(calls, ["acquire-lock", "validate-registry", "release-owner", "release-lock", "cleanup-jobs"]);
+});
+
+test("SessionEnd leaves an unregistered or externally supplied broker report-only", async () => {
+  const calls = [];
+  await handleSessionEnd(
+    { cwd: ROOT, session_id: "session-unregistered" },
+    {
+      loadBrokerSessionImpl() {
+        return {
+          endpoint: "unix:/tmp/unregistered-broker.sock",
+          pid: 4150,
+          pidIdentity: "4150@Mon Jul 27 00:00:50 2026"
+        };
+      },
+      sendBrokerShutdownImpl() {
+        calls.push("shutdown-broker");
+      },
+      teardownBrokerSessionImpl() {
+        calls.push("teardown-broker");
+        return { verified: true };
+      },
+      clearBrokerSessionImpl() {
+        calls.push("clear-broker");
+      },
+      cleanupSessionJobsImpl() {
+        calls.push("cleanup-jobs");
+        return { verified: true, failures: [] };
+      }
+    }
+  );
+
+  assert.deepEqual(calls, ["cleanup-jobs"]);
 });
 
 test("detached fixture keepalive self-expires when parent cleanup is skipped", async (t) => {

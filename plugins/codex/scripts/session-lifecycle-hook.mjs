@@ -236,7 +236,7 @@ export async function handleSessionEnd(input, dependencies = {}) {
     }
   }
 
-  const brokerShutdownAllowed = !registry || registryAssessment?.safeToShutdown === true;
+  const brokerShutdownAllowed = registryAssessment?.safeToShutdown === true;
   let brokerCleanup = { verified: true };
   let registryLockReleaseFailure = null;
   try {

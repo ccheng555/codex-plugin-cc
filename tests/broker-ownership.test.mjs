@@ -102,6 +102,44 @@ test("a well-formed lock whose creator is absent is quarantined before retry", (
   assert.equal(fs.existsSync(stale.path), false);
 });
 
+test("a stale-lock contender cannot quarantine a replacement live lock", (t) => {
+  const { registration } = makeFixture(t);
+  const stale = acquireBrokerRegistryLock(registration, {
+    pid: 5002,
+    now: () => "2026-07-27T00:00:32.000Z"
+  });
+  assert.equal(stale.acquired, true);
+
+  let replacement;
+  let livenessChecks = 0;
+  const contender = acquireBrokerRegistryLock(registration, {
+    pid: 5004,
+    now: () => "2026-07-27T00:00:34.000Z",
+    getLiveProcessPidsImpl(pids) {
+      livenessChecks += 1;
+      if (livenessChecks === 1) {
+        const staleRoot = path.join(registration.registryDir, "stale-locks");
+        fs.mkdirSync(staleRoot, { recursive: true, mode: 0o700 });
+        fs.chmodSync(staleRoot, 0o700);
+        fs.renameSync(stale.path, path.join(staleRoot, `${5002}-${stale.token}`));
+        replacement = acquireBrokerRegistryLock(registration, {
+          pid: 5003,
+          now: () => "2026-07-27T00:00:33.000Z"
+        });
+        assert.equal(replacement.acquired, true);
+        return [];
+      }
+      return pids.includes(5003) ? [5003] : [];
+    }
+  });
+
+  assert.equal(contender.acquired, false);
+  assert.equal(contender.reason, "registry-busy");
+  const liveOwner = JSON.parse(fs.readFileSync(path.join(replacement.path, "owner.json"), "utf8"));
+  assert.equal(liveOwner.token, replacement.token);
+  assert.deepEqual(releaseBrokerRegistryLock(registration, replacement), { released: true });
+});
+
 test("registered broker with a live owner is not eligible for cleanup", (t) => {
   const { registration, env } = makeFixture(t);
   const liveOwner = ownerEnv(env, "session-live", 5100, "Mon Jul 27 00:01:00 2026");

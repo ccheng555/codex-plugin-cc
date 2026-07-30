@@ -22,6 +22,10 @@ function isSafePid(value) {
   return Number.isSafeInteger(value) && value > 1;
 }
 
+function isRegistryLockToken(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
 function isPidIdentity(pid, identity) {
   return isSafePid(pid) && typeof identity === "string" && identity.startsWith(`${pid}@`) && identity.length > String(pid).length + 1;
 }
@@ -137,8 +141,7 @@ function validRegistryLock(registration, lock) {
     validRegistrationReference(registration) &&
       lock?.acquired === true &&
       lock.brokerKey === registration.brokerKey &&
-      typeof lock.token === "string" &&
-      lock.token.length > 0 &&
+      isRegistryLockToken(lock.token) &&
       lock.path === path.join(registration.registryDir, REGISTRY_LOCK_DIR_NAME)
   );
 }
@@ -198,7 +201,7 @@ export function acquireBrokerRegistryLock(
       existingOwner?.version !== BROKER_OWNERSHIP_VERSION ||
       existingOwner.kind !== "registry-lock" ||
       existingOwner.brokerKey !== registration.brokerKey ||
-      typeof existingOwner.token !== "string" ||
+      !isRegistryLockToken(existingOwner.token) ||
       !isSafePid(existingOwner.pid)
     ) {
       return { acquired: false, reason: "registry-lock-malformed", path: lockPath };
@@ -215,12 +218,14 @@ export function acquireBrokerRegistryLock(
 
     const staleRoot = path.join(registration.registryDir, "stale-locks");
     ensurePrivateDir(staleRoot);
+    const stalePath = path.join(staleRoot, `${existingOwner.pid}-${existingOwner.token}`);
     try {
-      fs.renameSync(lockPath, path.join(staleRoot, `${existingOwner.pid}-${randomUUID()}`));
+      fs.renameSync(lockPath, stalePath);
     } catch (error) {
-      if (error?.code !== "ENOENT") {
-        return { acquired: false, reason: "registry-lock-quarantine-failed", path: lockPath };
+      if (error?.code === "ENOENT" || error?.code === "EEXIST" || error?.code === "ENOTEMPTY") {
+        continue;
       }
+      return { acquired: false, reason: "registry-lock-quarantine-failed", path: lockPath };
     }
   }
   return { acquired: false, reason: "registry-lock-contention", path: lockPath };
@@ -592,8 +597,9 @@ export function loadBrokerChildren(registration) {
 
 export function releaseBrokerChild(
   registration,
-  { child, cleanupOutcome, now = () => new Date().toISOString() } = {}
+  options = {}
 ) {
+  const { child, cleanupOutcome, now = () => new Date().toISOString() } = options;
   if (!validRegistrationReference(registration)) {
     return { released: false, reason: "broker-registration-unavailable" };
   }
@@ -617,18 +623,21 @@ export function releaseBrokerChild(
     releasedAt: now()
   };
   const releasePath = path.join(registration.registryDir, "child-releases", `${child.childKey}.json`);
-  if (fs.existsSync(releasePath)) {
-    const existing = readJson(releasePath);
-    if (!validChildReleaseRecord(existing, releasePath, registration, child)) {
-      const error = new Error(`Invalid existing broker child release at ${releasePath}.`);
-      error.code = "BROKER_OWNERSHIP_COLLISION";
-      throw error;
+  const locked = withBrokerRegistryLock(registration, options, () => {
+    if (fs.existsSync(releasePath)) {
+      const existing = readJson(releasePath);
+      if (!validChildReleaseRecord(existing, releasePath, registration, child)) {
+        const error = new Error(`Invalid existing broker child release at ${releasePath}.`);
+        error.code = "BROKER_OWNERSHIP_COLLISION";
+        throw error;
+      }
+      fs.chmodSync(releasePath, 0o600);
+      return { released: true, path: releasePath, release: existing };
     }
-    fs.chmodSync(releasePath, 0o600);
-    return { released: true, path: releasePath, release: existing };
-  }
-  createImmutableJson(releasePath, payload);
-  return { released: true, path: releasePath, release: payload };
+    createImmutableJson(releasePath, payload);
+    return { released: true, path: releasePath, release: payload };
+  });
+  return locked.ok ? locked.value : { released: false, reason: locked.reason };
 }
 
 export function publishBrokerReaperReceipt(

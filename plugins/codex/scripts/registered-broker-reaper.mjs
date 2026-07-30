@@ -12,6 +12,7 @@ import {
   loadBrokerChildren,
   loadBrokerRegistration,
   publishBrokerReaperReceipt,
+  releaseBrokerChild,
   releaseBrokerRegistryLock,
   resolveBrokerOwnershipRoot
 } from "./lib/broker-ownership.mjs";
@@ -178,8 +179,33 @@ async function processRegistration(candidate, options) {
               killPollAttempts: options.killPollAttempts,
               pollIntervalMs: options.pollIntervalMs
             });
-            outcomes.push({ target: "child", pid: child.pid, pidIdentity: child.pidIdentity, outcome });
             if (outcome?.verified !== true) {
+              outcomes.push({ target: "child", pid: child.pid, pidIdentity: child.pidIdentity, outcome });
+              cleanupVerified = false;
+              break;
+            }
+            let childRelease;
+            try {
+              childRelease = (options.releaseBrokerChildImpl ?? releaseBrokerChild)(lockedRegistration, {
+                child,
+                cleanupOutcome: outcome,
+                now: options.now,
+                registryLock
+              });
+            } catch (error) {
+              childRelease = { released: false, reason: `child-release-error:${error.message}` };
+            }
+            outcomes.push({
+              target: "child",
+              pid: child.pid,
+              pidIdentity: child.pidIdentity,
+              outcome,
+              childRelease: {
+                released: childRelease?.released === true,
+                reason: childRelease?.reason ?? null
+              }
+            });
+            if (childRelease?.released !== true) {
               cleanupVerified = false;
               break;
             }

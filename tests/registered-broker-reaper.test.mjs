@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   acquireBrokerRegistryLock,
+  loadBrokerChildren,
   publishBrokerChild,
   publishBrokerRegistration,
   registerBrokerOwner,
@@ -137,6 +138,61 @@ test("registered cleanup reclaims children before the broker and writes a mode-0
   assert.ok(receiptPath);
   assert.equal(fs.statSync(receiptPath).mode & 0o777, 0o600);
   assert.equal(JSON.parse(fs.readFileSync(receiptPath, "utf8")).decision, "cleanup-verified");
+});
+
+test("each verified child is released before a later target can block convergence", async (t) => {
+  const { env, registration } = makeFixture(t, { child: true });
+  publishBrokerChild(registration, {
+    ownershipSnapshot: snapshot(4300, 3),
+    now: () => "2026-07-27T01:03:00.000Z"
+  });
+  addReleasedOwner(registration, env);
+  const orderedChildren = loadBrokerChildren(registration).children;
+  assert.equal(orderedChildren.length, 2);
+  const firstProcessedChild = orderedChildren[0];
+  const blockedChild = orderedChildren[1];
+
+  let firstPassGroupCalls = 0;
+  let firstPassBrokerCalls = 0;
+  const firstPass = await runRegisteredBrokerReaper({
+    mode: "apply-registered",
+    env,
+    getLiveProcessPidsImpl: () => [],
+    terminateProcessGroupImpl: async () => {
+      firstPassGroupCalls += 1;
+      if (firstPassGroupCalls === 1) {
+        return { attempted: true, delivered: true, verified: true, degraded: false, survivors: [], survivorIdentities: [] };
+      }
+      return { attempted: true, delivered: true, verified: false, degraded: true, survivors: [blockedChild.pid], survivorIdentities: [blockedChild.pidIdentity] };
+    },
+    terminateProcessTreeImpl: async () => { firstPassBrokerCalls += 1; },
+    attemptIdFactory: () => "attempt-partial-child-release"
+  });
+  assert.equal(firstPass.reaped, 0);
+  assert.equal(firstPassGroupCalls, 2);
+  assert.equal(firstPassBrokerCalls, 0);
+  const afterFirstPass = loadBrokerChildren(registration);
+  assert.equal(afterFirstPass.valid, true);
+  assert.deepEqual(afterFirstPass.releasedChildren.map((child) => child.childKey), [firstProcessedChild.childKey]);
+  assert.deepEqual(afterFirstPass.children.map((child) => child.childKey), [blockedChild.childKey]);
+
+  const secondPassCalls = [];
+  const secondPass = await runRegisteredBrokerReaper({
+    mode: "apply-registered",
+    env,
+    getLiveProcessPidsImpl: () => [],
+    terminateProcessGroupImpl: async (pgid) => {
+      secondPassCalls.push(`group:${pgid}`);
+      return { attempted: true, delivered: true, verified: true, degraded: false, survivors: [], survivorIdentities: [] };
+    },
+    terminateProcessTreeImpl: async (pid) => {
+      secondPassCalls.push(`tree:${pid}`);
+      return { attempted: true, delivered: true, verified: true, degraded: false, survivors: [], survivorIdentities: [] };
+    },
+    attemptIdFactory: () => "attempt-converged-child-release"
+  });
+  assert.equal(secondPass.reaped, 1);
+  assert.deepEqual(secondPassCalls, [`group:${blockedChild.processGroupId}`, `tree:${registration.broker.pid}`]);
 });
 
 test("a contended registry lock closes the registration-to-signal race", async (t) => {
