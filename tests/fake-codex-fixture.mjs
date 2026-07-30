@@ -288,7 +288,7 @@ if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-chil
     bootState.helperPids = [...(bootState.helperPids || []), helper.pid];
   }
 }
-if (BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "crash-with-post-snapshot-helper" || BEHAVIOR === "crash-with-post-activation-regrouped-helper") {
+if (BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "crash-with-post-snapshot-helper" || BEHAVIOR === "crash-with-post-activation-regrouped-helper" || BEHAVIOR === "post-activation-helper-on-thread-list") {
   bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 }
 saveState(bootState);
@@ -376,6 +376,15 @@ rl.on("line", (line) => {
       }
 
       case "thread/list": {
+        if (BEHAVIOR === "post-activation-helper-on-thread-list" && !state.helperPids?.length) {
+          const helper = spawn(process.execPath, ["-e", SELF_EXPIRING_KEEPALIVE], {
+            detached: process.platform !== "win32",
+            stdio: "ignore"
+          });
+          helper.unref();
+          state.helperPids = [helper.pid];
+          saveState(state);
+        }
         let threads = state.threads.slice();
         if (message.params.cwd) {
           threads = threads.filter((thread) => thread.cwd === message.params.cwd);

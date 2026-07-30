@@ -590,6 +590,105 @@ test("shared broker durably observes and reclaims a post-activation regrouped he
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 2);
 });
 
+test("shared broker tears down a post-activation helper before reporting observation lock contention", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for helper ownership cleanup.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "post-activation-helper-on-thread-list");
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "1000"
+  }, "observation-contention");
+  const brokerSession = await ensureBrokerSession(repo, { env });
+  if (!brokerSession) {
+    t.skip("broker socket unavailable in this sandbox");
+    return;
+  }
+
+  let helperPid = null;
+  let appServerPid = null;
+  let registryLock = null;
+  const client = await CodexAppServerClient.connect(repo, { env });
+  t.after(async () => {
+    await client.close().catch(() => {});
+    if (registryLock?.acquired === true) {
+      const currentRegistration = loadBrokerRegistration({
+        endpoint: brokerSession.endpoint,
+        brokerIdentity: brokerSession.pidIdentity,
+        env
+      });
+      releaseBrokerRegistryLock(currentRegistration, registryLock);
+      registryLock = null;
+    }
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+    for (const pid of [helperPid, appServerPid]) {
+      if (!pid) {
+        continue;
+      }
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Ignore fixture processes already reclaimed by the broker.
+      }
+    }
+  });
+
+  function isLive(pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code !== "ESRCH";
+    }
+  }
+
+  await client.request("account/read", {});
+  const registration = loadBrokerRegistration({
+    endpoint: brokerSession.endpoint,
+    brokerIdentity: brokerSession.pidIdentity,
+    env
+  });
+  assert.equal(registration.registered, true);
+  registryLock = acquireBrokerRegistryLock(registration);
+  assert.equal(registryLock.acquired, true);
+
+  try {
+    await assert.rejects(
+      client.request("thread/list", { cwd: repo }),
+      (error) => {
+        const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+        helperPid = state.helperPids?.[0] ?? null;
+        appServerPid = state.appServerPids?.[0] ?? null;
+        return (
+          error?.rpcCode === -32005 &&
+          /registry-busy/.test(error.message) &&
+          helperPid !== null &&
+          appServerPid !== null &&
+          !isLive(helperPid) &&
+          !isLive(appServerPid)
+        );
+      }
+    );
+  } finally {
+    assert.equal(releaseBrokerRegistryLock(registration, registryLock).released, true);
+    registryLock = null;
+  }
+
+  const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(state.appServerStarts, 1);
+  assert.equal(isLive(helperPid), false);
+  assert.equal(isLive(appServerPid), false);
+});
+
 test("automatic broker registration preserves a shared broker until its final owner releases", async (t) => {
   if (process.platform === "win32") {
     t.skip("Unix process identities are required for the registered broker contract.");

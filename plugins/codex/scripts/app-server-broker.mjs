@@ -23,6 +23,7 @@ const BROKER_CLEANUP_UNVERIFIED_RPC_CODE = -32002;
 const BROKER_SHUTDOWN_RPC_CODE = -32003;
 const BROKER_NOT_ACTIVATED_RPC_CODE = -32004;
 const BROKER_ACTIVATION_ACK = "activated";
+const CHILD_OBSERVATION_RETRY_DELAYS_MS = [10, 25, 50, 100];
 
 export function isBrokerRequestAllowedDuringShutdown(shuttingDown, message) {
   return !shuttingDown || message?.method === "broker/shutdown";
@@ -70,6 +71,22 @@ function flushSocket(socket) {
 
 function isInterruptRequest(message) {
   return message?.method === "turn/interrupt";
+}
+
+function isRegistryContention(reason) {
+  return reason === "registry-busy" || reason === "registry-lock-contention";
+}
+
+async function publishChildObservationWithRetry(registration, options) {
+  let observation = publishBrokerChildObservation(registration, options);
+  for (const delayMs of CHILD_OBSERVATION_RETRY_DELAYS_MS) {
+    if (observation.observed === true || !isRegistryContention(observation.reason)) {
+      return observation;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    observation = publishBrokerChildObservation(registration, options);
+  }
+  return observation;
 }
 
 function writePidFile(pidFile) {
@@ -233,6 +250,19 @@ async function main() {
     await appClientClosePromise;
   }
 
+  async function prepareRequestErrorForReply(error) {
+    if (error?.requiresChildTeardown !== true) {
+      return error;
+    }
+    await closeAppClient();
+    if (!blockedCleanup) {
+      return error;
+    }
+    const cleanupError = new Error("Shared Codex app-server cleanup is unverified after ownership publication failed.");
+    cleanupError.rpcCode = BROKER_CLEANUP_UNVERIFIED_RPC_CODE;
+    return cleanupError;
+  }
+
   function scheduleChildIdleClose() {
     cancelChildIdleClose();
     if (!appClient || hasActiveWork()) {
@@ -348,13 +378,14 @@ async function main() {
             error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
             throw error;
           }
-          const observation = publishBrokerChildObservation(registration, {
+          const observation = await publishChildObservationWithRetry(registration, {
             child: childRegistration.child,
             ownershipSnapshot
           });
           if (observation.observed !== true) {
             const error = new Error(`Unable to publish shared Codex app-server helper ownership (${observation.reason ?? "unknown"}).`);
             error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
+            error.requiresChildTeardown = true;
             throw error;
           }
           childRegistration = {
@@ -607,9 +638,10 @@ async function main() {
             const result = await client.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
           } catch (error) {
+            const replyError = await prepareRequestErrorForReply(error);
             send(socket, {
               id: message.id,
-              error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
+              error: buildJsonRpcError(replyError.rpcCode ?? -32000, replyError.message)
             });
           } finally {
             inFlightRequests -= 1;
@@ -645,9 +677,10 @@ async function main() {
             activeRequestSocket = null;
           }
         } catch (error) {
+          const replyError = await prepareRequestErrorForReply(error);
           send(socket, {
             id: message.id,
-            error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
+            error: buildJsonRpcError(replyError.rpcCode ?? -32000, replyError.message)
           });
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
