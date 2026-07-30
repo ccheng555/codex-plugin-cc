@@ -4,15 +4,124 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { publishBrokerRegistration, registerBrokerOwner } from "./broker-ownership.mjs";
+import {
+  acquireBrokerRegistryLock,
+  assessBrokerOwners,
+  hasLiveBrokerOwnerIdentity,
+  loadBrokerRegistration,
+  publishRegisteredBroker,
+  registerBrokerOwner,
+  releaseBrokerOwner,
+  releaseBrokerRegistryLock,
+  resolveBrokerOwnershipRoot
+} from "./broker-ownership.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { captureProcessOwnership } from "./process.mjs";
+import { captureProcessOwnership, getProcessIdentity, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
+const BROKER_ACTIVATION_ACK = "activated";
+const BROKER_LAUNCH_LOCK_HOST = "127.0.0.1";
+const BROKER_LAUNCH_LOCK_MIN_PORT = 49152;
+const BROKER_LAUNCH_LOCK_PORT_COUNT = 16384;
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function brokerLaunchLockIdentity(cwd) {
+  return createHash("sha256").update(resolveBrokerStateFile(cwd)).digest("hex");
+}
+
+export function brokerLaunchLockPort(cwd) {
+  const identity = brokerLaunchLockIdentity(cwd);
+  const digest = Buffer.from(identity, "hex");
+  return BROKER_LAUNCH_LOCK_MIN_PORT + (digest.readUInt16BE(0) % BROKER_LAUNCH_LOCK_PORT_COUNT);
+}
+
+function tryListenForBrokerLaunch(port, greeting) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer((socket) => socket.end(`${greeting}\n`));
+    const onError = (error) => {
+      if (error?.code === "EADDRINUSE") {
+        resolve(null);
+        return;
+      }
+      reject(error);
+    };
+    server.once("error", onError);
+    server.listen({ host: BROKER_LAUNCH_LOCK_HOST, port, exclusive: true }, () => {
+      server.removeListener("error", onError);
+      resolve(server);
+    });
+  });
+}
+
+function probeBrokerLaunchPort(port, expectedGreeting, timeoutMs = 150) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: BROKER_LAUNCH_LOCK_HOST, port });
+    let connected = false;
+    let buffer = "";
+    let settled = false;
+    const finish = (state) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(state);
+    };
+    const timer = setTimeout(() => finish(connected ? "foreign" : "transient"), timeoutMs);
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      connected = true;
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (buffer.includes("\n")) {
+        finish(buffer.trim() === expectedGreeting ? "matching" : "foreign");
+      }
+    });
+    socket.on("end", () => finish(buffer.trim() === expectedGreeting ? "matching" : "foreign"));
+    socket.on("error", () => finish("transient"));
+  });
+}
+
+export async function acquireBrokerLaunchLock(cwd, options = {}) {
+  const identity = brokerLaunchLockIdentity(cwd);
+  const greeting = `codex-broker-launch-v1:${identity}`;
+  const port = brokerLaunchLockPort(cwd);
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const server = await tryListenForBrokerLaunch(port, greeting);
+    if (server) {
+      return {
+        port,
+        async release() {
+          await new Promise((resolve) => server.close(resolve));
+        }
+      };
+    }
+    const observed = await probeBrokerLaunchPort(port, greeting);
+    if (observed === "foreign") {
+      const error = new Error("The deterministic Codex broker launch lock is occupied by another local service.");
+      error.code = "BROKER_LAUNCH_LOCK_UNAVAILABLE";
+      throw error;
+    }
+    await delay(25);
+  }
+
+  const error = new Error("Timed out waiting for another Codex broker launch to finish.");
+  error.code = "BROKER_LAUNCH_LOCK_TIMEOUT";
+  throw error;
+}
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -60,15 +169,119 @@ export async function sendBrokerShutdown(endpoint) {
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
-    cwd,
-    env,
-    detached: true,
-    stdio: ["ignore", logFd, logFd]
+  try {
+    const child = spawn(
+      process.execPath,
+      [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile, "--require-activation-stdin"],
+      {
+        cwd,
+        env,
+        detached: true,
+        stdio: ["pipe", logFd, logFd, "pipe"]
+      }
+    );
+    child.on("error", () => {});
+    return child;
+  } finally {
+    fs.closeSync(logFd);
+  }
+}
+
+export function activateBrokerProcess(child, timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    const status = child?.stdio?.[3];
+    if (!child?.stdin || !status) {
+      const error = new Error("Broker activation channels are unavailable.");
+      error.code = "BROKER_ACTIVATION_FAILED";
+      reject(error);
+      return;
+    }
+
+    let buffer = "";
+    let settled = false;
+    const ignoreStdinError = () => {};
+    const cleanup = () => {
+      clearTimeout(timer);
+      status.removeListener("data", onData);
+      status.removeListener("error", onStatusError);
+      child.removeListener("error", onChildError);
+      child.removeListener("exit", onChildExit);
+      child.stdin.removeListener("error", onStdinError);
+    };
+    const finish = (error = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      status.destroy();
+      child.stdin.on("error", ignoreStdinError);
+      if (error) {
+        reject(error);
+        return;
+      }
+      child.unref();
+      resolve();
+    };
+    const activationError = (message) => {
+      const error = new Error(message);
+      error.code = "BROKER_ACTIVATION_FAILED";
+      return error;
+    };
+    const onData = (chunk) => {
+      buffer += chunk;
+      if (buffer.includes("\n")) {
+        finish(buffer.trim() === BROKER_ACTIVATION_ACK
+          ? null
+          : activationError(`Unexpected broker activation response: ${buffer.trim() || "empty"}.`));
+      }
+    };
+    const onStatusError = (error) => finish(activationError(`Broker activation response failed: ${error.message}`));
+    const onChildError = (error) => finish(activationError(`Broker activation process failed: ${error.message}`));
+    const onChildExit = () => finish(activationError("Broker exited before activation completed."));
+    const onStdinError = (error) => finish(activationError(`Broker activation request failed: ${error.message}`));
+    const timer = setTimeout(
+      () => finish(activationError("Timed out waiting for broker activation acknowledgement.")),
+      timeoutMs
+    );
+
+    status.setEncoding("utf8");
+    status.on("data", onData);
+    status.once("error", onStatusError);
+    child.once("error", onChildError);
+    child.once("exit", onChildExit);
+    child.stdin.once("error", onStdinError);
+    child.stdin.end("activate\n");
   });
-  child.unref();
-  fs.closeSync(logFd);
-  return child;
+}
+
+function closeBrokerActivationChannels(child) {
+  if (child?.stdin && !child.stdin.destroyed) {
+    child.stdin.once("error", () => {});
+    child.stdin.end();
+  }
+  child?.stdio?.[3]?.destroy();
+}
+
+async function waitForBrokerProcessExit(child, timeoutMs = 1000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return true;
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
 }
 
 function resolveBrokerStateFile(cwd) {
@@ -91,7 +304,20 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  const stateFile = resolveBrokerStateFile(cwd);
+  const temporaryStateFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryStateFile, `${JSON.stringify(session, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600
+    });
+    fs.renameSync(temporaryStateFile, stateFile);
+  } finally {
+    if (fs.existsSync(temporaryStateFile)) {
+      fs.unlinkSync(temporaryStateFile);
+    }
+  }
 }
 
 export function clearBrokerSession(cwd) {
@@ -99,6 +325,49 @@ export function clearBrokerSession(cwd) {
   if (fs.existsSync(stateFile)) {
     fs.unlinkSync(stateFile);
   }
+}
+
+export function loadReusableBrokerSession(cwd, env = process.env) {
+  if (!resolveBrokerOwnershipRoot(env) || !hasLiveBrokerOwnerIdentity(env)) {
+    return null;
+  }
+  const session = loadBrokerSession(cwd);
+  if (
+    session?.activationPending === true ||
+    session?.activationFailed === true ||
+    session?.registry?.registered !== true ||
+    typeof session.pidIdentity !== "string"
+  ) {
+    return null;
+  }
+  try {
+    if (getProcessIdentity(session.pid, { cwd, env }) !== session.pidIdentity) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const registration = loadBrokerRegistration({
+    endpoint: session.endpoint,
+    brokerIdentity: session.pidIdentity,
+    env
+  });
+  if (
+    registration.registered !== true ||
+    registration.brokerKey !== session.registry.brokerKey ||
+    registration.registryDir !== session.registry.registryDir
+  ) {
+    return null;
+  }
+  try {
+    const target = parseBrokerEndpoint(session.endpoint);
+    if (target.kind !== "unix" || !fs.lstatSync(target.path).isSocket()) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return { ...session, registry: registration };
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -112,30 +381,98 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
-export async function ensureBrokerSession(cwd, options = {}) {
-  // Automatic brokers are detached and outlive the process that spawned them.
-  // Until Windows has a durable, reuse-resistant process identity for the
-  // registry, use the attached direct app-server lifecycle instead of
-  // publishing an unregistered broker that SessionEnd must refuse to signal.
-  if ((options.platform ?? process.platform) === "win32") {
-    return null;
+async function rollbackNewBrokerSession(cwd, child, session, options) {
+  closeBrokerActivationChannels(child);
+  const exited = await waitForBrokerProcessExit(child, options.rollbackExitTimeoutMs ?? 1000);
+  let cleanup;
+  try {
+    cleanup = await teardownBrokerSession({
+      endpoint: session.endpoint,
+      pidFile: session.pidFile,
+      logFile: session.logFile,
+      sessionDir: session.sessionDir,
+      pid: session.pid,
+      pidIdentity: session.pidIdentity,
+      ownershipSnapshot: session.ownershipSnapshot,
+      requireVerifiedOwnership: session.ownershipCaptureFailed === true,
+      killProcess: exited ? null : (options.killProcess ?? terminateProcessTree)
+    });
+  } finally {
+    child?.unref?.();
   }
 
-  const existing = loadBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    if (existing.registry?.registered === true) {
-      const owner = registerBrokerOwner(existing.registry, { env: options.env ?? process.env });
-      if (owner.registered !== true) {
-        const error = new Error(`Unable to register this session as a shared Codex broker owner (${owner.reason ?? "unknown"}).`);
-        error.code = "BROKER_OWNER_REGISTRATION_FAILED";
+  if (cleanup?.verified === true) {
+    clearBrokerSession(cwd);
+    return cleanup;
+  }
+
+  try {
+    saveBrokerSession(cwd, { ...session, activationFailed: true });
+  } catch {
+    // Preserve the cleanup outcome as the primary failure if even the
+    // report-only recovery record cannot be written.
+  }
+  return cleanup;
+}
+
+async function cleanupExistingBrokerSession(cwd, existing, options) {
+  const env = options.env ?? process.env;
+  const acquireRegistryLock = options.acquireBrokerRegistryLockImpl ?? acquireBrokerRegistryLock;
+  const releaseRegistryLock = options.releaseBrokerRegistryLockImpl ?? releaseBrokerRegistryLock;
+  const registryLock = acquireRegistryLock(existing.registry);
+  if (registryLock?.acquired !== true) {
+    const error = new Error(`Broker cleanup eligibility could not be locked (${registryLock?.reason ?? "unknown"}).`);
+    error.code = "BROKER_CLEANUP_UNVERIFIED";
+    throw error;
+  }
+
+  try {
+    const loadRegistration = options.loadBrokerRegistrationImpl ?? loadBrokerRegistration;
+    const registration = loadRegistration({
+      endpoint: existing.endpoint,
+      brokerIdentity: existing.pidIdentity,
+      env
+    });
+    if (
+      registration.registered !== true ||
+      registration.brokerKey !== existing.registry.brokerKey ||
+      registration.registryDir !== existing.registry.registryDir
+    ) {
+      const error = new Error("The existing Codex broker registration is invalid; cleanup remains report-only.");
+      error.code = "BROKER_REGISTRATION_REQUIRED";
+      throw error;
+    }
+
+    const readProcessIdentity = options.getProcessIdentityImpl ?? getProcessIdentity;
+    let currentIdentity;
+    try {
+      currentIdentity = readProcessIdentity(existing.pid, { cwd, env });
+    } catch (cause) {
+      const error = new Error("Broker liveness could not be verified; cleanup remains report-only.");
+      error.code = "BROKER_CLEANUP_UNVERIFIED";
+      error.cause = cause;
+      throw error;
+    }
+    if (currentIdentity && currentIdentity !== existing.pidIdentity) {
+      const error = new Error("The saved broker PID has been reused; refusing to signal it or start a replacement.");
+      error.code = "BROKER_CLEANUP_UNVERIFIED";
+      throw error;
+    }
+    if (currentIdentity === existing.pidIdentity) {
+      const assessOwners = options.assessBrokerOwnersImpl ?? assessBrokerOwners;
+      const assessment = assessOwners(registration);
+      if (assessment?.safeToShutdown !== true) {
+        if (assessment?.reason === "live-owner") {
+          return { cleaned: false, blockedByLiveOwner: true };
+        }
+        const error = new Error(`Broker ownership is ambiguous (${assessment?.reason ?? "unknown"}); cleanup remains report-only.`);
+        error.code = "BROKER_CLEANUP_UNVERIFIED";
         throw error;
       }
     }
-    return existing;
-  }
 
-  if (existing) {
-    const cleanup = await teardownBrokerSession({
+    const teardownBroker = options.teardownBrokerSessionImpl ?? teardownBrokerSession;
+    const cleanup = await teardownBroker({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
       logFile: existing.logFile ?? null,
@@ -144,7 +481,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pidIdentity: existing.pidIdentity ?? null,
       ownershipSnapshot: existing.ownershipSnapshot ?? null,
       requireVerifiedOwnership: existing.ownershipCaptureFailed === true,
-      killProcess: options.killProcess ?? null
+      killProcess: options.killProcess ?? terminateProcessTree
     });
     if (cleanup?.verified !== true) {
       const error = new Error("Broker cleanup is unverified; refusing to start another broker session.");
@@ -152,6 +489,99 @@ export async function ensureBrokerSession(cwd, options = {}) {
       throw error;
     }
     clearBrokerSession(cwd);
+    return { cleaned: true, cleanup };
+  } finally {
+    const released = releaseRegistryLock(existing.registry, registryLock);
+    if (released?.released !== true) {
+      const error = new Error(`Broker registry lock release failed (${released?.reason ?? "unknown"}).`);
+      error.code = "BROKER_CLEANUP_UNVERIFIED";
+      throw error;
+    }
+  }
+}
+
+async function ensureBrokerSessionLocked(cwd, options = {}) {
+  const env = options.env ?? process.env;
+  // Automatic brokers are detached and outlive the process that spawned them.
+  // Until Windows has a durable, reuse-resistant process identity for the
+  // registry, use the attached direct app-server lifecycle instead of
+  // publishing an unregistered broker that SessionEnd must refuse to signal.
+  const stateFileExists = fs.existsSync(resolveBrokerStateFile(cwd));
+  const existing = loadBrokerSession(cwd);
+  if (stateFileExists && !existing) {
+    return null;
+  }
+  if (existing && existing.registry?.registered !== true) {
+    return null;
+  }
+  let existingProcessIdentity = null;
+  if (existing && existing.activationFailed !== true) {
+    try {
+      const readProcessIdentity = options.getProcessIdentityImpl ?? getProcessIdentity;
+      existingProcessIdentity = readProcessIdentity(existing.pid, { cwd, env });
+    } catch (cause) {
+      const error = new Error("Existing broker liveness could not be verified; refusing reuse or replacement.");
+      error.code = "BROKER_CLEANUP_UNVERIFIED";
+      error.cause = cause;
+      throw error;
+    }
+  }
+  if (
+    existing &&
+    existing.activationPending !== true &&
+    existing.activationFailed !== true &&
+    existingProcessIdentity === existing.pidIdentity &&
+    (await isBrokerEndpointReady(existing.endpoint))
+  ) {
+    const acquireRegistryLock = options.acquireBrokerRegistryLockImpl ?? acquireBrokerRegistryLock;
+    const releaseRegistryLock = options.releaseBrokerRegistryLockImpl ?? releaseBrokerRegistryLock;
+    const registryLock = acquireRegistryLock(existing.registry);
+    if (registryLock?.acquired !== true) {
+      return null;
+    }
+    try {
+      const loadRegistration = options.loadBrokerRegistrationImpl ?? loadBrokerRegistration;
+      const registration = loadRegistration({
+        endpoint: existing.endpoint,
+        brokerIdentity: existing.pidIdentity,
+        env
+      });
+      if (
+        registration.registered !== true ||
+        registration.brokerKey !== existing.registry.brokerKey ||
+        registration.registryDir !== existing.registry.registryDir ||
+        !hasLiveBrokerOwnerIdentity(env)
+      ) {
+        return null;
+      }
+      const readProcessIdentity = options.getProcessIdentityImpl ?? getProcessIdentity;
+      if (
+        readProcessIdentity(existing.pid, { cwd, env }) !== existing.pidIdentity ||
+        !(await isBrokerEndpointReady(existing.endpoint))
+      ) {
+        return null;
+      }
+      const registerOwner = options.registerBrokerOwnerImpl ?? registerBrokerOwner;
+      const owner = registerOwner(registration, { env, registryLock });
+      if (owner.registered !== true) {
+        return null;
+      }
+      return { ...existing, registry: registration };
+    } finally {
+      const released = releaseRegistryLock(existing.registry, registryLock);
+      if (released?.released !== true) {
+        const error = new Error(`Broker registry lock release failed (${released?.reason ?? "unknown"}).`);
+        error.code = "BROKER_CLEANUP_UNVERIFIED";
+        throw error;
+      }
+    }
+  }
+
+  if (existing) {
+    const recovery = await cleanupExistingBrokerSession(cwd, existing, options);
+    if (recovery.blockedByLiveOwner) {
+      return null;
+    }
   }
 
   const sessionDir = createBrokerSessionDir();
@@ -163,7 +593,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     options.scriptPath ??
     fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
 
-  const child = spawnBrokerProcess({
+  const spawnBroker = options.spawnBrokerProcessImpl ?? spawnBrokerProcess;
+  const child = spawnBroker({
     scriptPath,
     cwd,
     endpoint,
@@ -187,44 +618,6 @@ export async function ensureBrokerSession(cwd, options = {}) {
     }
   }
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
-    const cleanup = await teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: child.pid ?? null,
-      pidIdentity: ownershipSnapshot?.rootIdentity ?? null,
-      ownershipSnapshot,
-      requireVerifiedOwnership: ownershipCaptureFailed,
-      killProcess: options.killProcess ?? null
-    });
-    if (cleanup?.verified !== true) {
-      return null;
-    }
-    return null;
-  }
-
-  let registry = null;
-  try {
-    const candidate = publishBrokerRegistration({
-      cwd,
-      endpoint,
-      pid: child.pid ?? null,
-      ownershipSnapshot,
-      env: options.env ?? process.env
-    });
-    if (candidate.registered === true) {
-      const owner = registerBrokerOwner(candidate, { env: options.env ?? process.env });
-      if (owner.registered === true) {
-        registry = candidate;
-      }
-    }
-  } catch (error) {
-    process.stderr.write(`Warning: unable to publish Codex broker ownership: ${error.message}. Broker remains unregistered.\n`);
-  }
-
   const session = {
     endpoint,
     pidFile,
@@ -234,10 +627,99 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidIdentity: ownershipSnapshot?.rootIdentity ?? null,
     ownershipSnapshot,
     ownershipCaptureFailed,
-    registry
+    registry: null
   };
-  saveBrokerSession(cwd, session);
-  return session;
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  if (!ready) {
+    const cleanup = await rollbackNewBrokerSession(cwd, child, session, options);
+    if (cleanup?.verified !== true) {
+      const error = new Error("Failed broker startup cleanup is unverified; refusing to create or hide another process.");
+      error.code = "BROKER_CLEANUP_UNVERIFIED";
+      throw error;
+    }
+    return null;
+  }
+
+  let fallbackToDirect = false;
+  let ownerRegistered = false;
+  try {
+    const publishRegistration = options.publishRegisteredBrokerImpl ?? publishRegisteredBroker;
+    const candidate = publishRegistration({
+      cwd,
+      endpoint,
+      pid: child.pid ?? null,
+      ownershipSnapshot,
+      env
+    });
+    if (candidate.registered !== true) {
+      fallbackToDirect = [
+        "broker-identity-unavailable",
+        "plugin-data-unavailable",
+        "session-owner-not-live",
+        "session-owner-unavailable"
+      ].includes(candidate.reason);
+      throw new Error(`Broker registration is unavailable (${candidate.reason ?? "unknown"}).`);
+    }
+    session.registry = candidate;
+    ownerRegistered = true;
+    const saveSession = options.saveBrokerSessionImpl ?? saveBrokerSession;
+    session.activationPending = true;
+    saveSession(cwd, session);
+
+    const activateBroker = options.activateBrokerProcessImpl ?? activateBrokerProcess;
+    await activateBroker(child, options.activationTimeoutMs ?? 2000);
+    session.activationPending = false;
+    saveSession(cwd, session);
+    return session;
+  } catch (error) {
+    if (ownerRegistered) {
+      const releaseOwner = options.releaseBrokerOwnerImpl ?? releaseBrokerOwner;
+      try {
+        const released = releaseOwner(session.registry, { env });
+        if (released.released !== true) {
+          process.stderr.write(`Warning: unable to release rolled-back Codex broker owner (${released.reason ?? "unknown"}).\n`);
+        }
+      } catch (releaseError) {
+        process.stderr.write(`Warning: unable to release rolled-back Codex broker owner: ${releaseError.message}.\n`);
+      }
+    }
+    const cleanup = await rollbackNewBrokerSession(cwd, child, session, options);
+    if (cleanup?.verified !== true) {
+      const cleanupError = new Error(`Broker launch failed and exact rollback is unverified: ${error.message}`);
+      cleanupError.code = "BROKER_CLEANUP_UNVERIFIED";
+      cleanupError.cause = error;
+      throw cleanupError;
+    }
+    if (fallbackToDirect) {
+      return null;
+    }
+    const transactionError = new Error(`Broker launch transaction failed: ${error.message}`);
+    transactionError.code = "BROKER_REGISTRATION_FAILED";
+    transactionError.cause = error;
+    throw transactionError;
+  }
+}
+
+export async function ensureBrokerSession(cwd, options = {}) {
+  if ((options.platform ?? process.platform) === "win32") {
+    return null;
+  }
+  const env = options.env ?? process.env;
+  if (!resolveBrokerOwnershipRoot(env) || !hasLiveBrokerOwnerIdentity(env)) {
+    return null;
+  }
+  const acquireLaunchLock = options.acquireBrokerLaunchLockImpl ?? acquireBrokerLaunchLock;
+  let launchLock;
+  try {
+    launchLock = await acquireLaunchLock(cwd, { timeoutMs: options.launchLockTimeoutMs ?? 10_000 });
+  } catch {
+    return null;
+  }
+  try {
+    return await ensureBrokerSessionLocked(cwd, options);
+  } finally {
+    await launchLock.release();
+  }
 }
 
 export async function teardownBrokerSession({

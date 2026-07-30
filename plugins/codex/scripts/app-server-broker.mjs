@@ -16,6 +16,8 @@ const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const BROKER_CLEANUP_UNVERIFIED_RPC_CODE = -32002;
 const BROKER_SHUTDOWN_RPC_CODE = -32003;
+const BROKER_NOT_ACTIVATED_RPC_CODE = -32004;
+const BROKER_ACTIVATION_ACK = "activated";
 
 export function isBrokerRequestAllowedDuringShutdown(shuttingDown, message) {
   return !shuttingDown || message?.method === "broker/shutdown";
@@ -80,7 +82,8 @@ async function main() {
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint"],
+    booleanOptions: ["require-activation-stdin"]
   });
 
   if (!options.endpoint) {
@@ -91,6 +94,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const activationRequired = options["require-activation-stdin"] === true;
   writePidFile(pidFile);
 
   const childIdleMs = resolveChildIdleMs();
@@ -102,6 +106,8 @@ async function main() {
   let inFlightRequests = 0;
   let shutdownPromise = null;
   let shuttingDown = false;
+  let activated = !activationRequired;
+  let activationAbortStarted = false;
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
@@ -408,6 +414,50 @@ async function main() {
     return shutdownPromise;
   }
 
+  function setupActivationGate(server) {
+    let buffer = "";
+    const abort = () => {
+      if (activated || activationAbortStarted) {
+        return;
+      }
+      activationAbortStarted = true;
+      void shutdown(server)
+        .catch(() => {})
+        .finally(() => process.exit(1));
+    };
+
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      if (activated || activationAbortStarted) {
+        return;
+      }
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      const command = buffer.slice(0, newlineIndex).trim();
+      if (command !== "activate") {
+        abort();
+        return;
+      }
+      activated = true;
+      try {
+        fs.writeSync(3, `${BROKER_ACTIVATION_ACK}\n`);
+        fs.closeSync(3);
+      } catch {
+        activated = false;
+        abort();
+      }
+    });
+    process.stdin.on("end", abort);
+    process.stdin.on("error", abort);
+    process.stdin.resume();
+    if (process.stdin.readableEnded) {
+      abort();
+    }
+  }
+
   const server = net.createServer((socket) => {
     if (shuttingDown) {
       socket.destroy();
@@ -442,6 +492,17 @@ async function main() {
             id: null,
             error: buildJsonRpcError(-32700, `Invalid JSON: ${error.message}`)
           });
+          continue;
+        }
+
+        if (activationRequired && !activated && message.method !== "broker/shutdown") {
+          if (message.id !== undefined) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_NOT_ACTIVATED_RPC_CODE, "Shared Codex broker is not activated.")
+            });
+          }
+          socket.end();
           continue;
         }
 
@@ -582,7 +643,11 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, () => {
+    if (activationRequired) {
+      setupActivationGate(server);
+    }
+  });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

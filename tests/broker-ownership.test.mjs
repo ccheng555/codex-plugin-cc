@@ -10,6 +10,7 @@ import {
   loadBrokerChildren,
   publishBrokerChild,
   publishBrokerRegistration,
+  publishRegisteredBroker,
   registerBrokerOwner,
   releaseBrokerChild,
   releaseBrokerOwner,
@@ -57,6 +58,73 @@ function ownerEnv(env, sessionId, pid, startedAt) {
     CODEX_COMPANION_SESSION_OWNER_IDENTITY: `${pid}@${startedAt}`
   };
 }
+
+test("initial broker and owner records become visible atomically", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-atomic-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = ownerEnv({ CLAUDE_PLUGIN_DATA: root }, "session-atomic", 5050, "Mon Jul 27 00:00:45 2026");
+  const brokerIdentity = "4100@Mon Jul 27 00:00:00 2026";
+  const registration = publishRegisteredBroker({
+    cwd: root,
+    endpoint: `unix:${path.join(root, "broker.sock")}`,
+    pid: 4100,
+    ownershipSnapshot: {
+      rootPid: 4100,
+      rootIdentity: brokerIdentity,
+      processGroupId: 4100,
+      members: []
+    },
+    env,
+    now: () => "2026-07-27T00:00:00.000Z",
+    hasLiveProcessIdentityImpl: (pid, identity) => pid === 5050 && identity === "5050@Mon Jul 27 00:00:45 2026"
+  });
+
+  assert.equal(registration.registered, true);
+  assert.equal(fs.existsSync(path.join(registration.registryDir, "broker.json")), true);
+  assert.equal(fs.readdirSync(path.join(registration.registryDir, "owners")).length, 1);
+  assert.equal(fs.readdirSync(registration.registryRoot).some((name) => name.endsWith(".prepared")), false);
+});
+
+test("missing owner identity prevents any broker registry publication", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-no-owner-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const registration = publishRegisteredBroker({
+    cwd: root,
+    endpoint: `unix:${path.join(root, "broker.sock")}`,
+    pid: 4100,
+    ownershipSnapshot: {
+      rootPid: 4100,
+      rootIdentity: "4100@Mon Jul 27 00:00:00 2026",
+      processGroupId: 4100,
+      members: []
+    },
+    env: { CLAUDE_PLUGIN_DATA: root }
+  });
+
+  assert.deepEqual(registration, { registered: false, reason: "session-owner-unavailable" });
+  assert.equal(fs.existsSync(path.join(root, "state", "broker-ownership-v1")), false);
+});
+
+test("stale owner identity prevents any broker registry publication", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-stale-owner-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const registration = publishRegisteredBroker({
+    cwd: root,
+    endpoint: `unix:${path.join(root, "broker.sock")}`,
+    pid: 4100,
+    ownershipSnapshot: {
+      rootPid: 4100,
+      rootIdentity: "4100@Mon Jul 27 00:00:00 2026",
+      processGroupId: 4100,
+      members: []
+    },
+    env: ownerEnv({ CLAUDE_PLUGIN_DATA: root }, "session-stale", 5050, "Mon Jul 27 00:00:45 2026"),
+    hasLiveProcessIdentityImpl: () => false
+  });
+
+  assert.deepEqual(registration, { registered: false, reason: "session-owner-not-live" });
+  assert.equal(fs.existsSync(path.join(root, "state", "broker-ownership-v1")), false);
+});
 
 test("owner publication fails closed while cleanup holds the registry lock", (t) => {
   const { registration, env } = makeFixture(t);

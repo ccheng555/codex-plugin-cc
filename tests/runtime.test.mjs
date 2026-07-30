@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -11,8 +12,8 @@ import { enqueueBackgroundTask, handleCancel, handleTaskWorker } from "../plugin
 import { cleanupSessionJobs, handleSessionEnd, handleSessionStart } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { isBrokerRequestAllowedDuringShutdown } from "../plugins/codex/scripts/app-server-broker.mjs";
-import { SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
-import { clearBrokerSession, ensureBrokerSession, loadBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { acquireBrokerRegistryLock, loadBrokerRegistration, registerBrokerOwner, releaseBrokerRegistryLock, SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
+import { acquireBrokerLaunchLock, activateBrokerProcess, brokerLaunchLockPort, clearBrokerSession, ensureBrokerSession, loadBrokerSession, loadReusableBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
 import { captureProcessOwnership, getProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { hasCancelFlag, listJobs, loadState, resolveStateDir, saveState, upsertJob, writeCancelFlag, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
@@ -23,16 +24,28 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const BROKER_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "app-server-broker.mjs");
 const DETACHED_FIXTURE_TTL_MS = 5 * 60 * 1000;
 const SELF_EXPIRING_KEEPALIVE = selfExpiringKeepaliveCode();
 const runtimeTempDirs = new Set();
 const runtimePluginDataDir = createTempDir("codex-plugin-runtime-state-");
 process.env.CLAUDE_PLUGIN_DATA = runtimePluginDataDir;
+let brokerOwnerSequence = 0;
 
 function makeTempDir(prefix) {
   const tempDir = createTempDir(prefix);
   runtimeTempDirs.add(tempDir);
   return tempDir;
+}
+
+function withBrokerOwner(env, label) {
+  brokerOwnerSequence += 1;
+  return {
+    ...env,
+    CODEX_COMPANION_SESSION_ID: `runtime-${label}-${brokerOwnerSequence}`,
+    [SESSION_OWNER_PID_ENV]: String(process.pid),
+    [SESSION_OWNER_IDENTITY_ENV]: getProcessIdentity(process.pid)
+  };
 }
 
 function selfExpiringKeepaliveCode(ttlMs = DETACHED_FIXTURE_TTL_MS) {
@@ -499,10 +512,10 @@ test("shared broker reclaims a post-snapshot helper before allowing replacement"
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "crash-with-post-snapshot-helper");
-  const env = {
+  const env = withBrokerOwner({
     ...buildEnv(binDir),
     CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "1000"
-  };
+  }, "post-snapshot-helper");
   const brokerSession = await ensureBrokerSession(repo, { env });
   if (!brokerSession) {
     t.skip("broker socket unavailable in this sandbox");
@@ -653,6 +666,595 @@ test("automatic broker registration preserves a shared broker until its final ow
   });
 });
 
+test("existing broker reuse holds the registry lock through owner publication", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const baseEnv = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir,
+    [SESSION_OWNER_PID_ENV]: String(process.pid),
+    [SESSION_OWNER_IDENTITY_ENV]: getProcessIdentity(process.pid)
+  };
+  const envA = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "locked-reuse-a" };
+  const envB = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "locked-reuse-b" };
+  const first = await ensureBrokerSession(repo, { env: envA });
+  let heldLock = null;
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env: envB,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "locked-reuse-b" })
+    });
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env: envA,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "locked-reuse-a" })
+    });
+  });
+
+  const second = await ensureBrokerSession(repo, {
+    env: envB,
+    acquireBrokerRegistryLockImpl(registration) {
+      heldLock = acquireBrokerRegistryLock(registration);
+      return heldLock;
+    },
+    loadBrokerRegistrationImpl(args) {
+      assert.equal(heldLock?.acquired, true);
+      return loadBrokerRegistration(args);
+    },
+    registerBrokerOwnerImpl(registration, options) {
+      assert.equal(options.registryLock, heldLock);
+      return registerBrokerOwner(registration, options);
+    },
+    releaseBrokerRegistryLockImpl(registration, lock) {
+      assert.equal(lock, heldLock);
+      const released = releaseBrokerRegistryLock(registration, lock);
+      heldLock = null;
+      return released;
+    }
+  });
+
+  assert.equal(second.pid, first.pid);
+  assert.equal(heldLock, null);
+});
+
+test("deterministic broker launch lock never splits across fallback resources", async (t) => {
+  const repo = makeTempDir();
+  const port = brokerLaunchLockPort(repo);
+  const foreignServer = net.createServer((socket) => socket.end("foreign-service\n"));
+  await new Promise((resolve, reject) => {
+    foreignServer.once("error", reject);
+    foreignServer.listen({ host: "127.0.0.1", port, exclusive: true }, resolve);
+  });
+  t.after(async () => {
+    if (foreignServer.listening) {
+      await new Promise((resolve) => foreignServer.close(resolve));
+    }
+  });
+
+  await assert.rejects(
+    acquireBrokerLaunchLock(repo, { timeoutMs: 250 }),
+    (error) => error?.code === "BROKER_LAUNCH_LOCK_UNAVAILABLE"
+  );
+  await new Promise((resolve) => foreignServer.close(resolve));
+
+  const first = await acquireBrokerLaunchLock(repo, { timeoutMs: 250 });
+  assert.equal(first.port, port);
+  try {
+    await assert.rejects(
+      acquireBrokerLaunchLock(repo, { timeoutMs: 75 }),
+      (error) => error?.code === "BROKER_LAUNCH_LOCK_TIMEOUT"
+    );
+  } finally {
+    await first.release();
+  }
+  const next = await acquireBrokerLaunchLock(repo, { timeoutMs: 250 });
+  assert.equal(next.port, port);
+  await next.release();
+});
+
+test("automatic broker falls back to direct mode when its launch lock cannot bind", async () => {
+  const repo = makeTempDir();
+  const env = withBrokerOwner(process.env, "launch-lock-bind-denied");
+  let endpointCreated = false;
+
+  const session = await ensureBrokerSession(repo, {
+    env,
+    async acquireBrokerLaunchLockImpl() {
+      const error = new Error("loopback bind denied");
+      error.code = "EACCES";
+      throw error;
+    },
+    createBrokerEndpoint() {
+      endpointCreated = true;
+      return "unix:/unused.sock";
+    }
+  });
+
+  assert.equal(session, null);
+  assert.equal(endpointCreated, false);
+});
+
+test("automatic and explicit reuse paths refuse a live unregistered endpoint", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix broker sockets are required for this contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const socketPath = path.join("/private/tmp", `cxc-unregistered-${process.pid}-${Date.now()}.sock`);
+  const endpoint = `unix:${socketPath}`;
+  let brokerConnections = 0;
+  const server = net.createServer((socket) => {
+    brokerConnections += 1;
+    socket.end();
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  saveBrokerSession(repo, { endpoint, registry: null });
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    clearBrokerSession(repo);
+    if (fs.existsSync(socketPath)) {
+      fs.unlinkSync(socketPath);
+    }
+  });
+
+  const directClient = await CodexAppServerClient.connect(repo, {
+    reuseExistingBroker: true,
+    env: buildEnv(binDir)
+  });
+  await directClient.close();
+  assert.equal(brokerConnections, 0);
+
+  assert.equal(
+    await ensureBrokerSession(repo, {
+      env: withBrokerOwner(process.env, "unregistered-refusal")
+    }),
+    null
+  );
+  assert.equal(loadBrokerSession(repo)?.endpoint, endpoint);
+  assert.equal(brokerConnections, 0);
+});
+
+test("invalid legacy broker state falls back to direct mode without deleting evidence", async () => {
+  const repo = makeTempDir();
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const statePath = path.join(stateDir, "broker.json");
+  fs.writeFileSync(statePath, "{truncated\n", "utf8");
+
+  const session = await ensureBrokerSession(repo, {
+    env: withBrokerOwner(process.env, "invalid-legacy-state")
+  });
+
+  assert.equal(session, null);
+  assert.equal(fs.readFileSync(statePath, "utf8"), "{truncated\n");
+  fs.unlinkSync(statePath);
+});
+
+test("automatic broker rolls back when the broker registration cannot be published", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const socketPath = path.join("/private/tmp", `cxc-publish-failure-${process.pid}-${Date.now()}.sock`);
+  installFakeCodex(binDir, "review-ok");
+  const ownerIdentity = getProcessIdentity(process.pid);
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir,
+    CODEX_COMPANION_SESSION_ID: "publish-failure-owner",
+    [SESSION_OWNER_PID_ENV]: String(process.pid),
+    [SESSION_OWNER_IDENTITY_ENV]: ownerIdentity
+  };
+  let brokerPid = null;
+
+  await assert.rejects(
+    ensureBrokerSession(repo, {
+      env,
+      createBrokerEndpoint: () => `unix:${socketPath}`,
+      captureProcessOwnershipImpl(pid, options) {
+        brokerPid = pid;
+        return captureProcessOwnership(pid, options);
+      },
+      publishRegisteredBrokerImpl() {
+        throw new Error("injected broker registration failure");
+      }
+    }),
+    (error) => error?.code === "BROKER_REGISTRATION_FAILED"
+  );
+
+  assert.ok(Number.isFinite(brokerPid));
+  await waitFor(() => {
+    try {
+      process.kill(brokerPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+  assert.equal(loadBrokerSession(repo), null);
+  assert.equal(fs.existsSync(socketPath), false);
+});
+
+test("automatic broker rolls back when owner, state, or activation publication fails", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const ownerIdentity = getProcessIdentity(process.pid);
+  for (const failure of ["owner", "state", "activation"]) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    const socketPath = path.join("/private/tmp", `cxc-${failure}-failure-${process.pid}-${Date.now()}.sock`);
+    installFakeCodex(binDir, "review-ok");
+    const env = {
+      ...buildEnv(binDir),
+      CLAUDE_PLUGIN_DATA: runtimePluginDataDir,
+      CODEX_COMPANION_SESSION_ID: `${failure}-failure-owner`,
+      [SESSION_OWNER_PID_ENV]: String(process.pid),
+      [SESSION_OWNER_IDENTITY_ENV]: ownerIdentity
+    };
+    let brokerPid = null;
+
+    await assert.rejects(
+      ensureBrokerSession(repo, {
+        env,
+        createBrokerEndpoint: () => `unix:${socketPath}`,
+        captureProcessOwnershipImpl(pid, options) {
+          brokerPid = pid;
+          return captureProcessOwnership(pid, options);
+        },
+        publishRegisteredBrokerImpl: failure === "owner"
+          ? () => ({ registered: false, reason: "injected-owner-failure" })
+          : undefined,
+        saveBrokerSessionImpl: failure === "state"
+          ? () => {
+              throw new Error("injected state publication failure");
+            }
+          : undefined,
+        activateBrokerProcessImpl: failure === "activation"
+          ? async () => {
+              throw new Error("injected activation failure");
+            }
+          : undefined
+      }),
+      (error) => error?.code === "BROKER_REGISTRATION_FAILED"
+    );
+
+    assert.ok(Number.isFinite(brokerPid));
+    await waitFor(() => {
+      try {
+        process.kill(brokerPid, 0);
+        return false;
+      } catch (error) {
+        return error?.code === "ESRCH";
+      }
+    });
+    assert.equal(loadBrokerSession(repo), null);
+    assert.equal(fs.existsSync(socketPath), false);
+  }
+});
+
+test("a failed activation recovery marker is never reusable", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir
+  }, "failed-activation-marker");
+  const unverifiedCleanup = async () => ({
+    attempted: true,
+    delivered: false,
+    verified: false,
+    degraded: true,
+    survivors: []
+  });
+
+  await assert.rejects(
+    ensureBrokerSession(repo, {
+      env,
+      rollbackExitTimeoutMs: 0,
+      async activateBrokerProcessImpl(child) {
+        await activateBrokerProcess(child);
+        throw new Error("injected post-activation publication failure");
+      },
+      killProcess: unverifiedCleanup
+    }),
+    (error) => error?.code === "BROKER_CLEANUP_UNVERIFIED"
+  );
+
+  const failedSession = loadBrokerSession(repo);
+  t.after(async () => {
+    await sendBrokerShutdown(failedSession?.endpoint).catch(() => {});
+    if (Number.isFinite(failedSession?.pid)) {
+      await terminateProcessTree(failedSession.pid, {
+        expectedRootIdentity: failedSession.pidIdentity,
+        ownershipSnapshot: failedSession.ownershipSnapshot
+      }).catch(() => {});
+    }
+    clearBrokerSession(repo);
+  });
+  assert.equal(failedSession?.activationFailed, true);
+  assert.equal(loadReusableBrokerSession(repo, env), null);
+  assert.doesNotThrow(() => process.kill(failedSession.pid, 0));
+
+  await assert.rejects(
+    ensureBrokerSession(repo, { env, killProcess: unverifiedCleanup }),
+    (error) => error?.code === "BROKER_CLEANUP_UNVERIFIED"
+  );
+  assert.equal(loadBrokerSession(repo)?.pid, failedSession.pid);
+  assert.equal(loadBrokerSession(repo)?.activationFailed, true);
+});
+
+test("a broker remains non-reusable until activation is acknowledged", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir
+  }, "pending-activation");
+  let releaseActivation;
+  const activationGate = new Promise((resolve) => {
+    releaseActivation = resolve;
+  });
+  let session;
+  const launch = ensureBrokerSession(repo, {
+    env,
+    async activateBrokerProcessImpl(child) {
+      await activationGate;
+      await activateBrokerProcess(child);
+    }
+  });
+  t.after(async () => {
+    releaseActivation?.();
+    session ??= await launch.catch(() => null);
+    await sendBrokerShutdown(session?.endpoint).catch(() => {});
+    if (Number.isFinite(session?.pid)) {
+      await terminateProcessTree(session.pid, {
+        expectedRootIdentity: session.pidIdentity,
+        ownershipSnapshot: session.ownershipSnapshot
+      }).catch(() => {});
+    }
+    clearBrokerSession(repo);
+  });
+
+  await waitFor(() => loadBrokerSession(repo)?.activationPending === true);
+  assert.equal(loadReusableBrokerSession(repo, env), null);
+
+  releaseActivation();
+  session = await launch;
+  assert.equal(loadBrokerSession(repo)?.activationPending, false);
+  assert.equal(loadReusableBrokerSession(repo, env)?.pid, session.pid);
+});
+
+test("a registered broker with a missing socket is not reusable", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir
+  }, "missing-socket");
+  const session = await ensureBrokerSession(repo, { env });
+  t.after(async () => {
+    if (Number.isFinite(session?.pid)) {
+      await terminateProcessTree(session.pid, {
+        expectedRootIdentity: session.pidIdentity,
+        ownershipSnapshot: session.ownershipSnapshot
+      }).catch(() => {});
+    }
+    clearBrokerSession(repo);
+  });
+
+  assert.equal(loadReusableBrokerSession(repo, env)?.pid, session.pid);
+  fs.unlinkSync(session.endpoint.slice("unix:".length));
+  assert.equal(loadReusableBrokerSession(repo, env), null);
+});
+
+test("automatic broker falls back without leaving a process when session ownership is unavailable", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const socketPath = path.join("/private/tmp", `cxc-owner-unavailable-${process.pid}-${Date.now()}.sock`);
+  installFakeCodex(binDir, "review-ok");
+  let endpointFactoryCalled = false;
+  let brokerPid = null;
+
+  const session = await ensureBrokerSession(repo, {
+    env: buildEnv(binDir),
+    createBrokerEndpoint: () => {
+      endpointFactoryCalled = true;
+      return `unix:${socketPath}`;
+    },
+    captureProcessOwnershipImpl(pid, options) {
+      brokerPid = pid;
+      return captureProcessOwnership(pid, options);
+    }
+  });
+
+  assert.equal(session, null);
+  assert.equal(endpointFactoryCalled, false);
+  assert.equal(brokerPid, null);
+  assert.equal(loadBrokerSession(repo), null);
+  assert.equal(fs.existsSync(socketPath), false);
+});
+
+test("concurrent automatic broker launches converge on one registered process", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const ownerIdentity = getProcessIdentity(process.pid);
+  const baseEnv = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir,
+    [SESSION_OWNER_PID_ENV]: String(process.pid),
+    [SESSION_OWNER_IDENTITY_ENV]: ownerIdentity
+  };
+  const snapshots = [];
+  const capture = (pid, options) => {
+    const snapshot = captureProcessOwnership(pid, options);
+    snapshots.push(snapshot);
+    return snapshot;
+  };
+  t.after(async () => {
+    for (const snapshot of snapshots) {
+      await terminateProcessTree(snapshot.rootPid, {
+        expectedRootIdentity: snapshot.rootIdentity,
+        ownershipSnapshot: snapshot
+      }).catch(() => {});
+    }
+  });
+
+  const [first, second] = await Promise.all([
+    ensureBrokerSession(repo, {
+      env: { ...baseEnv, CODEX_COMPANION_SESSION_ID: "concurrent-owner-a" },
+      captureProcessOwnershipImpl: capture
+    }),
+    ensureBrokerSession(repo, {
+      env: { ...baseEnv, CODEX_COMPANION_SESSION_ID: "concurrent-owner-b" },
+      captureProcessOwnershipImpl: capture
+    })
+  ]);
+
+  assert.equal(first.pid, second.pid);
+  assert.equal(snapshots.length, 1);
+  assert.equal(loadBrokerSession(repo)?.pid, first.pid);
+  assert.equal(fs.readdirSync(path.join(first.registry.registryDir, "owners")).filter((name) => name.endsWith(".json")).length, 2);
+});
+
+test("an unreachable registered broker is never terminated while an owner is live", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix broker sockets are required for this contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const ownerIdentity = getProcessIdentity(process.pid);
+  const baseEnv = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir,
+    [SESSION_OWNER_PID_ENV]: String(process.pid),
+    [SESSION_OWNER_IDENTITY_ENV]: ownerIdentity
+  };
+  const first = await ensureBrokerSession(repo, {
+    env: { ...baseEnv, CODEX_COMPANION_SESSION_ID: "unreachable-live-owner-a" }
+  });
+  t.after(async () => {
+    await terminateProcessTree(first.pid, {
+      expectedRootIdentity: first.pidIdentity,
+      ownershipSnapshot: first.ownershipSnapshot
+    }).catch(() => {});
+    clearBrokerSession(repo);
+  });
+
+  const socketPath = first.endpoint.slice("unix:".length);
+  fs.unlinkSync(socketPath);
+  const second = await ensureBrokerSession(repo, {
+    env: { ...baseEnv, CODEX_COMPANION_SESSION_ID: "unreachable-live-owner-b" }
+  });
+
+  assert.equal(second, null);
+  assert.doesNotThrow(() => process.kill(first.pid, 0));
+  assert.equal(loadBrokerSession(repo)?.pid, first.pid);
+});
+
+test("pre-activation broker exits when its launcher pipe closes", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process groups are required for this contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const sessionDir = makeTempDir("cxc-launcher-exit-");
+  const socketPath = path.join("/private/tmp", `cxc-launcher-exit-${process.pid}-${Date.now()}.sock`);
+  const endpoint = `unix:${socketPath}`;
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const child = spawn(
+    process.execPath,
+    [BROKER_SCRIPT, "serve", "--endpoint", endpoint, "--cwd", repo, "--pid-file", pidFile, "--require-activation-stdin"],
+    { cwd: repo, detached: true, stdio: ["pipe", "ignore", "ignore"] }
+  );
+  const ownershipSnapshot = captureProcessOwnership(child.pid, { cwd: repo });
+  t.after(async () => {
+    child.stdin?.destroy();
+    await terminateProcessTree(child.pid, {
+      expectedRootIdentity: ownershipSnapshot.rootIdentity,
+      ownershipSnapshot
+    }).catch(() => {});
+  });
+
+  assert.equal(await waitForBrokerEndpoint(endpoint, 2000), true);
+  const preActivationResponse = await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: socketPath });
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ id: 1, method: "initialize", params: {} })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+    });
+    socket.on("end", () => resolve(JSON.parse(buffer.trim())));
+    socket.on("error", reject);
+  });
+  assert.equal(preActivationResponse.error?.code, -32004);
+  child.stdin.end();
+  await waitFor(() => {
+    try {
+      process.kill(child.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  }, { timeoutMs: 2000 });
+  assert.equal(fs.existsSync(socketPath), false);
+  assert.equal(fs.existsSync(pidFile), false);
+});
+
 test("automatic broker creation stays disabled where registered ownership is unsupported", async () => {
   const repo = makeTempDir();
   let endpointFactoryCalled = false;
@@ -720,7 +1322,7 @@ test("broker shutdown completes without starting a second app-server", async (t)
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "with-resistant-helper");
-  const env = buildEnv(binDir);
+  const env = withBrokerOwner(buildEnv(binDir), "broker-shutdown");
   const brokerSocketPath = path.join("/private/tmp", `cxc-p1c-${process.pid}-${Date.now()}.sock`);
   const brokerSession = await ensureBrokerSession(repo, {
     env,
@@ -1727,7 +2329,7 @@ test("task using the shared broker still completes when Codex spawns subagents",
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const env = buildEnv(binDir);
+  const env = withBrokerOwner(buildEnv(binDir), "subagent-task");
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
     env
@@ -3107,7 +3709,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const env = buildEnv(binDir);
+  const env = withBrokerOwner(buildEnv(binDir), "cancel-interrupt");
   const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
     cwd: repo,
     env
@@ -3504,7 +4106,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const env = buildEnv(binDir);
+  const env = withBrokerOwner(buildEnv(binDir), "lazy-reuse");
 
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
@@ -3543,10 +4145,10 @@ test("shared broker clears a disconnected stream after its request rejects", asy
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
 
   installSlowRejectFakeCodex(binDir);
-  const env = {
+  const env = withBrokerOwner({
     ...buildEnv(binDir),
     CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "1000"
-  };
+  }, "disconnected-stream");
   t.after(() => {
     run("node", [SESSION_HOOK, "SessionEnd"], {
       cwd: repo,
@@ -3601,10 +4203,10 @@ test("shared broker cleans up an app-server whose initialization returns an RPC 
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
 
   installInitializeErrorFakeCodex(binDir);
-  const env = {
+  const env = withBrokerOwner({
     ...buildEnv(binDir),
     CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "100"
-  };
+  }, "initialize-error");
   const brokerSession = await ensureBrokerSession(repo, { env });
   t.after(() => {
     if (brokerSession) {
@@ -3679,10 +4281,10 @@ test("shared broker releases its idle app-server child and restarts it on demand
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const env = {
+  const env = withBrokerOwner({
     ...buildEnv(binDir),
     CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "100"
-  };
+  }, "idle-child");
 
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
@@ -3787,10 +4389,10 @@ test("shared broker keeps active work alive after its client disconnects", async
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const env = {
+  const env = withBrokerOwner({
     ...buildEnv(binDir),
     CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "100"
-  };
+  }, "active-work");
   t.after(() => {
     run("node", [SESSION_HOOK, "SessionEnd"], {
       cwd: repo,
@@ -3845,7 +4447,7 @@ test("setup reuses an existing shared app-server without starting another one", 
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const env = buildEnv(binDir);
+  const env = withBrokerOwner(buildEnv(binDir), "setup-reuse");
 
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
@@ -3888,9 +4490,10 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
+  const env = withBrokerOwner(buildEnv(binDir), "status-runtime");
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
   assert.equal(review.status, 0, review.stderr);
 
@@ -3900,14 +4503,21 @@ test("status reports shared session runtime when a lazy broker is active", () =>
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Session runtime: shared session/);
+
+  const unownedResult = run("node", [SCRIPT, "status"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(unownedResult.status, 0, unownedResult.stderr);
+  assert.match(unownedResult.stdout, /Session runtime: direct startup/);
 });
 
-test("setup and status honor --cwd when reading shared session runtime", () => {
+test("setup and status ignore an unregistered saved runtime", () => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
 
@@ -3919,13 +4529,13 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
     cwd: invocationWorkspace
   });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /Session runtime: shared session/);
+  assert.match(status.stdout, /Session runtime: direct startup/);
 
   const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
     cwd: invocationWorkspace
   });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
-  assert.equal(payload.sessionRuntime.mode, "shared");
-  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.equal(payload.sessionRuntime.endpoint, null);
 });

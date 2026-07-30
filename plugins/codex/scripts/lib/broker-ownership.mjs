@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { getLiveProcessPids } from "./process.mjs";
+import { getLiveProcessPids, hasLiveProcessIdentity } from "./process.mjs";
 
 export const BROKER_OWNERSHIP_VERSION = 1;
 export const SESSION_OWNER_PID_ENV = "CODEX_COMPANION_SESSION_OWNER_PID";
@@ -368,6 +368,91 @@ function ownerFromEnv(env) {
   }
   const ownerKey = sha256(`${sessionId}\0${identity}`);
   return { ownerKey, sessionId, pid, identity };
+}
+
+export function hasLiveBrokerOwnerIdentity(env = process.env, options = {}) {
+  const owner = ownerFromEnv(env);
+  if (!owner) {
+    return false;
+  }
+  const hasLiveIdentity = options.hasLiveProcessIdentityImpl ?? hasLiveProcessIdentity;
+  try {
+    return hasLiveIdentity(owner.pid, owner.identity);
+  } catch {
+    return false;
+  }
+}
+
+export function publishRegisteredBroker({
+  cwd,
+  endpoint,
+  pid,
+  ownershipSnapshot,
+  env = process.env,
+  now = () => new Date().toISOString(),
+  hasLiveProcessIdentityImpl = hasLiveProcessIdentity
+}) {
+  const registryRoot = resolveBrokerOwnershipRoot(env);
+  if (!registryRoot) {
+    return { registered: false, reason: "plugin-data-unavailable" };
+  }
+  const owner = ownerFromEnv(env);
+  if (!owner) {
+    return { registered: false, reason: "session-owner-unavailable" };
+  }
+  if (!hasLiveBrokerOwnerIdentity(env, { hasLiveProcessIdentityImpl })) {
+    return { registered: false, reason: "session-owner-not-live" };
+  }
+  if (
+    typeof endpoint !== "string" ||
+    !endpoint ||
+    !isSafePid(pid) ||
+    ownershipSnapshot?.rootPid !== pid ||
+    !isPidIdentity(pid, ownershipSnapshot?.rootIdentity) ||
+    !isSafePid(ownershipSnapshot?.processGroupId)
+  ) {
+    return { registered: false, reason: "broker-identity-unavailable" };
+  }
+
+  const brokerKey = brokerOwnershipKey(endpoint, ownershipSnapshot.rootIdentity);
+  const registration = registrationReference(registryRoot, brokerKey);
+  const createdAt = now();
+  const broker = {
+    version: BROKER_OWNERSHIP_VERSION,
+    kind: "broker",
+    brokerKey,
+    endpoint,
+    pid,
+    pidIdentity: ownershipSnapshot.rootIdentity,
+    processGroupId: ownershipSnapshot.processGroupId,
+    workspaceHash: sha256(path.resolve(cwd)),
+    createdAt
+  };
+  const ownerRecord = {
+    version: BROKER_OWNERSHIP_VERSION,
+    kind: "owner",
+    brokerKey,
+    ownerKey: owner.ownerKey,
+    sessionId: owner.sessionId,
+    pid: owner.pid,
+    pidIdentity: owner.identity,
+    registeredAt: createdAt
+  };
+
+  ensurePrivateDir(registryRoot);
+  const preparedDir = path.join(registryRoot, `.${brokerKey}.${process.pid}.${randomUUID()}.prepared`);
+  fs.mkdirSync(preparedDir, { mode: 0o700 });
+  try {
+    createImmutableJson(path.join(preparedDir, "broker.json"), broker);
+    createImmutableJson(path.join(preparedDir, "owners", `${owner.ownerKey}.json`), ownerRecord);
+    fs.renameSync(preparedDir, registration.registryDir);
+    requirePrivateDirectory(registration.registryDir);
+    return { ...registration, broker, ownerKey: owner.ownerKey };
+  } finally {
+    if (fs.existsSync(preparedDir)) {
+      fs.rmSync(preparedDir, { recursive: true, force: true });
+    }
+  }
 }
 
 export function registerBrokerOwner(registration, options = {}) {

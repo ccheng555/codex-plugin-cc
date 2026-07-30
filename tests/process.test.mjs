@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { captureStableSessionOwner, getLiveProcessPids, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { captureStableSessionOwner, getLiveProcessPids, hasLiveProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 test("captureStableSessionOwner records the hook process-group leader", () => {
   const owner = captureStableSessionOwner(7101, {
@@ -46,6 +46,26 @@ test("captureStableSessionOwner refuses a hook that is its own process-group lea
   });
 
   assert.equal(owner, null);
+});
+
+test("hasLiveProcessIdentity excludes a matching zombie process", () => {
+  const identity = "7300@Mon Jul 27 00:09:00 2026";
+  const live = hasLiveProcessIdentity(7300, identity, {
+    platform: "darwin",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "7300 1 7300 Z Mon Jul 27 00:09:00 2026\n",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.equal(live, false);
 });
 
 test("terminateProcessTree uses taskkill on Windows", async () => {

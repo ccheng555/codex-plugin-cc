@@ -228,6 +228,19 @@ export function getProcessIdentity(pid, options = {}) {
   return readUnixProcessTable(options.runCommandImpl ?? runCommand, options).get(pid)?.identity ?? null;
 }
 
+export function hasLiveProcessIdentity(pid, identity, options = {}) {
+  if (
+    !Number.isFinite(pid) ||
+    typeof identity !== "string" ||
+    !identity ||
+    (options.platform ?? process.platform) === "win32"
+  ) {
+    return false;
+  }
+  const current = readUnixProcessTable(options.runCommandImpl ?? runCommand, options).get(pid);
+  return isRunningProcess(current) && current.identity === identity;
+}
+
 export function getLiveProcessPids(pids, options = {}) {
   const candidates = [...new Set((pids ?? []).filter((pid) => Number.isFinite(pid)))];
   const expectedIdentities = identitiesByPid(options.identities);
