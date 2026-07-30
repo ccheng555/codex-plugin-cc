@@ -1097,7 +1097,8 @@ export async function handleCancel(argv, dependencies = {}) {
   const cleanupOutcome = await (dependencies.terminateProcessTreeImpl ?? terminateProcessTree)(record.pid, {
     expectedRootIdentity,
     ownershipSnapshot: null,
-    requireVerifiedOwnership: ownershipCaptureFailed
+    requireVerifiedOwnership: ownershipCaptureFailed,
+    priorCleanupDegraded: existing.cleanupOutcome?.degraded === true
   });
   if (cleanupOutcome?.verified !== true) {
     const failureMessage =

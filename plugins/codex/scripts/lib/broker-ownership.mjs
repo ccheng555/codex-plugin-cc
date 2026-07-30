@@ -1,0 +1,811 @@
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+
+import { getLiveProcessPids } from "./process.mjs";
+
+export const BROKER_OWNERSHIP_VERSION = 1;
+export const SESSION_OWNER_PID_ENV = "CODEX_COMPANION_SESSION_OWNER_PID";
+export const SESSION_OWNER_IDENTITY_ENV = "CODEX_COMPANION_SESSION_OWNER_IDENTITY";
+
+const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const REGISTRY_DIR_NAME = "broker-ownership-v1";
+const REGISTRY_LOCK_DIR_NAME = "registry.lock";
+
+function sha256(value) {
+  return createHash("sha256").update(String(value)).digest("hex");
+}
+
+function isSafePid(value) {
+  return Number.isSafeInteger(value) && value > 1;
+}
+
+function isPidIdentity(pid, identity) {
+  return isSafePid(pid) && typeof identity === "string" && identity.startsWith(`${pid}@`) && identity.length > String(pid).length + 1;
+}
+
+function requirePrivateDirectory(dirPath) {
+  const stat = fs.lstatSync(dirPath);
+  if (stat.isSymbolicLink() || !stat.isDirectory() || (stat.mode & 0o777) !== 0o700) {
+    const error = new Error(`Broker ownership registry directory is not private: ${dirPath}.`);
+    error.code = "BROKER_OWNERSHIP_PERMISSIONS";
+    throw error;
+  }
+  return stat;
+}
+
+function requirePrivateFile(filePath) {
+  const stat = fs.lstatSync(filePath);
+  if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o777) !== 0o600) {
+    const error = new Error(`Broker ownership registry file is not private: ${filePath}.`);
+    error.code = "BROKER_OWNERSHIP_PERMISSIONS";
+    throw error;
+  }
+  return stat;
+}
+
+function ensurePrivateDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(dirPath);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    const error = new Error(`Refusing non-directory broker ownership path: ${dirPath}.`);
+    error.code = "BROKER_OWNERSHIP_PERMISSIONS";
+    throw error;
+  }
+  fs.chmodSync(dirPath, 0o700);
+  requirePrivateDirectory(dirPath);
+}
+
+function immutableJsonBytes(payload) {
+  return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+function createImmutableJson(filePath, payload) {
+  const bytes = immutableJsonBytes(payload);
+  ensurePrivateDir(path.dirname(filePath));
+  if (fs.existsSync(filePath)) {
+    requirePrivateFile(filePath);
+    if (fs.readFileSync(filePath, "utf8") !== bytes) {
+      const error = new Error(`Broker ownership registry collision at ${filePath}.`);
+      error.code = "BROKER_OWNERSHIP_COLLISION";
+      throw error;
+    }
+    fs.chmodSync(filePath, 0o600);
+    return filePath;
+  }
+
+  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(tempPath, bytes, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    fs.chmodSync(tempPath, 0o600);
+    try {
+      fs.linkSync(tempPath, filePath);
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      requirePrivateFile(filePath);
+      if (fs.readFileSync(filePath, "utf8") !== bytes) {
+        throw error;
+      }
+    }
+    fs.chmodSync(filePath, 0o600);
+    requirePrivateFile(filePath);
+    return filePath;
+  } finally {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+}
+
+function readJson(filePath) {
+  requirePrivateFile(filePath);
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function registrationReference(registryRoot, brokerKey) {
+  return {
+    registered: true,
+    version: BROKER_OWNERSHIP_VERSION,
+    brokerKey,
+    registryRoot,
+    registryDir: path.join(registryRoot, brokerKey)
+  };
+}
+
+function validRegistrationReference(registration) {
+  return Boolean(
+    registration?.registered === true &&
+      registration.version === BROKER_OWNERSHIP_VERSION &&
+      typeof registration.brokerKey === "string" &&
+      /^[a-f0-9]{64}$/.test(registration.brokerKey) &&
+      typeof registration.registryRoot === "string" &&
+      path.isAbsolute(registration.registryRoot) &&
+      registration.registryDir === path.join(registration.registryRoot, registration.brokerKey)
+  );
+}
+
+function validRegistryLock(registration, lock) {
+  return Boolean(
+    validRegistrationReference(registration) &&
+      lock?.acquired === true &&
+      lock.brokerKey === registration.brokerKey &&
+      typeof lock.token === "string" &&
+      lock.token.length > 0 &&
+      lock.path === path.join(registration.registryDir, REGISTRY_LOCK_DIR_NAME)
+  );
+}
+
+export function acquireBrokerRegistryLock(
+  registration,
+  {
+    now = () => new Date().toISOString(),
+    pid = process.pid,
+    getLiveProcessPidsImpl = getLiveProcessPids
+  } = {}
+) {
+  if (!validRegistrationReference(registration)) {
+    return { acquired: false, reason: "broker-registration-unavailable" };
+  }
+  requirePrivateDirectory(registration.registryRoot);
+  requirePrivateDirectory(registration.registryDir);
+  const lockPath = path.join(registration.registryDir, REGISTRY_LOCK_DIR_NAME);
+  const token = randomUUID();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const preparedPath = path.join(registration.registryDir, `.registry-lock.${pid}.${randomUUID()}`);
+    try {
+      ensurePrivateDir(preparedPath);
+      createImmutableJson(path.join(preparedPath, "owner.json"), {
+        version: BROKER_OWNERSHIP_VERSION,
+        kind: "registry-lock",
+        brokerKey: registration.brokerKey,
+        token,
+        pid,
+        acquiredAt: now()
+      });
+      try {
+        fs.renameSync(preparedPath, lockPath);
+        return { acquired: true, brokerKey: registration.brokerKey, token, path: lockPath };
+      } catch (error) {
+        if (error?.code !== "EEXIST" && error?.code !== "ENOTEMPTY") {
+          throw error;
+        }
+      }
+    } finally {
+      if (fs.existsSync(preparedPath)) {
+        fs.rmSync(preparedPath, { recursive: true, force: true });
+      }
+    }
+
+    let existingOwner;
+    try {
+      requirePrivateDirectory(lockPath);
+      existingOwner = readJson(path.join(lockPath, "owner.json"));
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        continue;
+      }
+      return { acquired: false, reason: "registry-lock-malformed", path: lockPath };
+    }
+    if (
+      existingOwner?.version !== BROKER_OWNERSHIP_VERSION ||
+      existingOwner.kind !== "registry-lock" ||
+      existingOwner.brokerKey !== registration.brokerKey ||
+      typeof existingOwner.token !== "string" ||
+      !isSafePid(existingOwner.pid)
+    ) {
+      return { acquired: false, reason: "registry-lock-malformed", path: lockPath };
+    }
+    let live;
+    try {
+      live = getLiveProcessPidsImpl([existingOwner.pid]);
+    } catch {
+      return { acquired: false, reason: "registry-lock-liveness-unavailable", path: lockPath };
+    }
+    if (!Array.isArray(live) || live.includes(existingOwner.pid)) {
+      return { acquired: false, reason: "registry-busy", path: lockPath };
+    }
+
+    const staleRoot = path.join(registration.registryDir, "stale-locks");
+    ensurePrivateDir(staleRoot);
+    try {
+      fs.renameSync(lockPath, path.join(staleRoot, `${existingOwner.pid}-${randomUUID()}`));
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        return { acquired: false, reason: "registry-lock-quarantine-failed", path: lockPath };
+      }
+    }
+  }
+  return { acquired: false, reason: "registry-lock-contention", path: lockPath };
+}
+
+export function releaseBrokerRegistryLock(registration, lock) {
+  if (!validRegistryLock(registration, lock)) {
+    return { released: false, reason: "registry-lock-unavailable" };
+  }
+  const ownerPath = path.join(lock.path, "owner.json");
+  try {
+    const owner = readJson(ownerPath);
+    if (
+      owner?.version !== BROKER_OWNERSHIP_VERSION ||
+      owner.kind !== "registry-lock" ||
+      owner.brokerKey !== registration.brokerKey ||
+      owner.token !== lock.token
+    ) {
+      return { released: false, reason: "registry-lock-mismatch" };
+    }
+    fs.unlinkSync(ownerPath);
+    fs.rmdirSync(lock.path);
+    return { released: true };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { released: false, reason: "registry-lock-missing" };
+    }
+    throw error;
+  }
+}
+
+function withBrokerRegistryLock(registration, options, action) {
+  const suppliedLock = options.registryLock;
+  if (suppliedLock && !validRegistryLock(registration, suppliedLock)) {
+    return { ok: false, reason: "registry-lock-unavailable" };
+  }
+  const lock = suppliedLock ?? acquireBrokerRegistryLock(registration, options);
+  if (lock.acquired !== true) {
+    return { ok: false, reason: lock.reason ?? "registry-busy" };
+  }
+  try {
+    return { ok: true, value: action() };
+  } finally {
+    if (!suppliedLock) {
+      const released = releaseBrokerRegistryLock(registration, lock);
+      if (released.released !== true) {
+        const error = new Error(`Unable to release broker registry lock (${released.reason}).`);
+        error.code = "BROKER_REGISTRY_LOCK_RELEASE_FAILED";
+        throw error;
+      }
+    }
+  }
+}
+
+export function resolveBrokerOwnershipRoot(env = process.env) {
+  const pluginDataDir = env?.[PLUGIN_DATA_ENV];
+  if (typeof pluginDataDir !== "string" || !path.isAbsolute(pluginDataDir)) {
+    return null;
+  }
+  return path.join(pluginDataDir, "state", REGISTRY_DIR_NAME);
+}
+
+export function brokerOwnershipKey(endpoint, brokerIdentity) {
+  return sha256(`${endpoint}\0${brokerIdentity}`);
+}
+
+export function loadBrokerRegistration({ endpoint, brokerIdentity, env = process.env }) {
+  const registryRoot = resolveBrokerOwnershipRoot(env);
+  if (!registryRoot || typeof endpoint !== "string" || !endpoint || typeof brokerIdentity !== "string" || !brokerIdentity) {
+    return { registered: false, reason: "missing-registration-identity" };
+  }
+  const registration = registrationReference(registryRoot, brokerOwnershipKey(endpoint, brokerIdentity));
+  const brokerPath = path.join(registration.registryDir, "broker.json");
+  if (!fs.existsSync(brokerPath)) {
+    return { registered: false, reason: "broker-record-absent" };
+  }
+  try {
+    requirePrivateDirectory(registryRoot);
+    requirePrivateDirectory(registration.registryDir);
+    const broker = readJson(brokerPath);
+    if (
+      broker?.version !== BROKER_OWNERSHIP_VERSION ||
+      broker.kind !== "broker" ||
+      broker.brokerKey !== registration.brokerKey ||
+      broker.endpoint !== endpoint ||
+      broker.pidIdentity !== brokerIdentity ||
+      !isPidIdentity(broker.pid, broker.pidIdentity)
+    ) {
+      return { registered: false, reason: "broker-record-invalid" };
+    }
+    return { ...registration, broker };
+  } catch {
+    return { registered: false, reason: "broker-record-invalid" };
+  }
+}
+
+export function publishBrokerRegistration({ cwd, endpoint, pid, ownershipSnapshot, env = process.env, now = () => new Date().toISOString() }) {
+  const registryRoot = resolveBrokerOwnershipRoot(env);
+  if (!registryRoot) {
+    return { registered: false, reason: "plugin-data-unavailable" };
+  }
+  if (
+    typeof endpoint !== "string" ||
+    !endpoint ||
+    !isSafePid(pid) ||
+    ownershipSnapshot?.rootPid !== pid ||
+    !isPidIdentity(pid, ownershipSnapshot?.rootIdentity) ||
+    !isSafePid(ownershipSnapshot?.processGroupId)
+  ) {
+    return { registered: false, reason: "broker-identity-unavailable" };
+  }
+
+  const brokerKey = brokerOwnershipKey(endpoint, ownershipSnapshot.rootIdentity);
+  const registration = registrationReference(registryRoot, brokerKey);
+  const existing = loadBrokerRegistration({ endpoint, brokerIdentity: ownershipSnapshot.rootIdentity, env });
+  if (existing.registered === true) {
+    return existing;
+  }
+  const broker = {
+    version: BROKER_OWNERSHIP_VERSION,
+    kind: "broker",
+    brokerKey,
+    endpoint,
+    pid,
+    pidIdentity: ownershipSnapshot.rootIdentity,
+    processGroupId: ownershipSnapshot.processGroupId,
+    workspaceHash: sha256(path.resolve(cwd)),
+    createdAt: now()
+  };
+  createImmutableJson(path.join(registration.registryDir, "broker.json"), broker);
+  return { ...registration, broker };
+}
+
+function ownerFromEnv(env) {
+  const sessionId = env?.[SESSION_ID_ENV];
+  const pid = Number(env?.[SESSION_OWNER_PID_ENV]);
+  const identity = env?.[SESSION_OWNER_IDENTITY_ENV];
+  if (typeof sessionId !== "string" || !sessionId || !isPidIdentity(pid, identity)) {
+    return null;
+  }
+  const ownerKey = sha256(`${sessionId}\0${identity}`);
+  return { ownerKey, sessionId, pid, identity };
+}
+
+export function registerBrokerOwner(registration, options = {}) {
+  const { env = process.env, now = () => new Date().toISOString() } = options;
+  if (!validRegistrationReference(registration)) {
+    return { registered: false, reason: "broker-registration-unavailable" };
+  }
+  const owner = ownerFromEnv(env);
+  if (!owner) {
+    return { registered: false, reason: "session-owner-unavailable" };
+  }
+  const locked = withBrokerRegistryLock(registration, options, () => {
+    const payload = {
+      version: BROKER_OWNERSHIP_VERSION,
+      kind: "owner",
+      brokerKey: registration.brokerKey,
+      ownerKey: owner.ownerKey,
+      sessionId: owner.sessionId,
+      pid: owner.pid,
+      pidIdentity: owner.identity,
+      registeredAt: now()
+    };
+    const ownerPath = path.join(registration.registryDir, "owners", `${owner.ownerKey}.json`);
+    if (fs.existsSync(ownerPath)) {
+      const existing = readJson(ownerPath);
+      if (!validOwnerRecord(existing, ownerPath, registration)) {
+        const error = new Error(`Invalid existing broker owner row at ${ownerPath}.`);
+        error.code = "BROKER_OWNERSHIP_COLLISION";
+        throw error;
+      }
+      fs.chmodSync(ownerPath, 0o600);
+      return { registered: true, ownerKey: owner.ownerKey, path: ownerPath, owner: existing };
+    }
+    createImmutableJson(ownerPath, payload);
+    return { registered: true, ownerKey: owner.ownerKey, path: ownerPath, owner: payload };
+  });
+  return locked.ok ? locked.value : { registered: false, reason: locked.reason };
+}
+
+export function releaseBrokerOwner(registration, options = {}) {
+  const { env = process.env, now = () => new Date().toISOString() } = options;
+  if (!validRegistrationReference(registration)) {
+    return { released: false, reason: "broker-registration-unavailable" };
+  }
+  const owner = ownerFromEnv(env);
+  if (!owner) {
+    return { released: false, reason: "session-owner-unavailable" };
+  }
+  const locked = withBrokerRegistryLock(registration, options, () => {
+    const payload = {
+      version: BROKER_OWNERSHIP_VERSION,
+      kind: "release",
+      brokerKey: registration.brokerKey,
+      ownerKey: owner.ownerKey,
+      sessionId: owner.sessionId,
+      pid: owner.pid,
+      pidIdentity: owner.identity,
+      releasedAt: now()
+    };
+    const releasePath = path.join(registration.registryDir, "releases", `${owner.ownerKey}.json`);
+    if (fs.existsSync(releasePath)) {
+      const existing = readJson(releasePath);
+      if (!validReleaseRecord(existing, releasePath, registration)) {
+        const error = new Error(`Invalid existing broker owner release at ${releasePath}.`);
+        error.code = "BROKER_OWNERSHIP_COLLISION";
+        throw error;
+      }
+      fs.chmodSync(releasePath, 0o600);
+      return { released: true, ownerKey: owner.ownerKey, path: releasePath, release: existing };
+    }
+    createImmutableJson(releasePath, payload);
+    return { released: true, ownerKey: owner.ownerKey, path: releasePath, release: payload };
+  });
+  return locked.ok ? locked.value : { released: false, reason: locked.reason };
+}
+
+function listJsonFiles(dirPath) {
+  try {
+    requirePrivateDirectory(dirPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  return fs.readdirSync(dirPath)
+    .filter((name) => name.endsWith(".json") && !name.startsWith("."))
+    .sort()
+    .map((name) => path.join(dirPath, name));
+}
+
+function validOwnerRecord(record, filePath, registration) {
+  return Boolean(
+    record?.version === BROKER_OWNERSHIP_VERSION &&
+      record.kind === "owner" &&
+      record.brokerKey === registration.brokerKey &&
+      typeof record.ownerKey === "string" &&
+      path.basename(filePath) === `${record.ownerKey}.json` &&
+      record.ownerKey === sha256(`${record.sessionId}\0${record.pidIdentity}`) &&
+      isPidIdentity(record.pid, record.pidIdentity) &&
+      typeof record.sessionId === "string" &&
+      record.sessionId.length > 0
+  );
+}
+
+function validReleaseRecord(record, filePath, registration) {
+  return Boolean(
+    record?.version === BROKER_OWNERSHIP_VERSION &&
+      record.kind === "release" &&
+      record.brokerKey === registration.brokerKey &&
+      typeof record.ownerKey === "string" &&
+      path.basename(filePath) === `${record.ownerKey}.json` &&
+      record.ownerKey === sha256(`${record.sessionId}\0${record.pidIdentity}`) &&
+      isPidIdentity(record.pid, record.pidIdentity) &&
+      typeof record.sessionId === "string" &&
+      record.sessionId.length > 0
+  );
+}
+
+function validSnapshotMember(record) {
+  return Boolean(
+    isSafePid(record?.pid) &&
+      Number.isSafeInteger(record.parentPid) &&
+      record.parentPid >= 0 &&
+      isSafePid(record.processGroupId) &&
+      typeof record.state === "string" &&
+      record.state.length > 0 &&
+      typeof record.startedAt === "string" &&
+      record.startedAt.length > 0 &&
+      isPidIdentity(record.pid, record.identity) &&
+      Number.isSafeInteger(record.depth) &&
+      record.depth >= 0
+  );
+}
+
+function validChildRecord(record, filePath, registration) {
+  const snapshot = record?.ownershipSnapshot;
+  return Boolean(
+    record?.version === BROKER_OWNERSHIP_VERSION &&
+      record.kind === "child" &&
+      record.brokerKey === registration.brokerKey &&
+      typeof record.childKey === "string" &&
+      record.childKey === sha256(record.pidIdentity) &&
+      path.basename(filePath) === `${record.childKey}.json` &&
+      isPidIdentity(record.pid, record.pidIdentity) &&
+      isSafePid(record.processGroupId) &&
+      snapshot?.rootPid === record.pid &&
+      snapshot.rootIdentity === record.pidIdentity &&
+      snapshot.processGroupId === record.processGroupId &&
+      Array.isArray(snapshot.members) &&
+      snapshot.members.length > 0 &&
+      snapshot.members.every(validSnapshotMember) &&
+      snapshot.members.some((member) => member.pid === record.pid && member.identity === record.pidIdentity)
+  );
+}
+
+function validChildReleaseRecord(record, filePath, registration, child) {
+  return Boolean(
+    child &&
+      record?.version === BROKER_OWNERSHIP_VERSION &&
+      record.kind === "child-release" &&
+      record.brokerKey === registration.brokerKey &&
+      record.childKey === child.childKey &&
+      path.basename(filePath) === `${record.childKey}.json` &&
+      record.pid === child.pid &&
+      record.pidIdentity === child.pidIdentity &&
+      record.cleanupVerified === true
+  );
+}
+
+export function loadBrokerChildren(registration) {
+  if (!validRegistrationReference(registration)) {
+    return { valid: false, reason: "broker-registration-unavailable", children: [], malformed: [] };
+  }
+  const children = [];
+  const releases = new Map();
+  const malformed = [];
+  let childFiles;
+  let childReleaseFiles;
+  try {
+    childFiles = listJsonFiles(path.join(registration.registryDir, "children"));
+    childReleaseFiles = listJsonFiles(path.join(registration.registryDir, "child-releases"));
+  } catch {
+    return {
+      valid: false,
+      reason: "malformed-child-registry",
+      children: [],
+      releasedChildren: [],
+      malformed: [registration.registryDir]
+    };
+  }
+  for (const filePath of childFiles) {
+    try {
+      const record = readJson(filePath);
+      if (!validChildRecord(record, filePath, registration)) {
+        malformed.push(filePath);
+      } else {
+        children.push(record);
+      }
+    } catch {
+      malformed.push(filePath);
+    }
+  }
+  const childrenByKey = new Map(children.map((child) => [child.childKey, child]));
+  for (const filePath of childReleaseFiles) {
+    try {
+      const record = readJson(filePath);
+      if (!validChildReleaseRecord(record, filePath, registration, childrenByKey.get(record?.childKey))) {
+        malformed.push(filePath);
+      } else {
+        releases.set(record.childKey, record);
+      }
+    } catch {
+      malformed.push(filePath);
+    }
+  }
+  return malformed.length > 0
+    ? { valid: false, reason: "malformed-child-registry", children: [], releasedChildren: [], malformed }
+    : {
+        valid: true,
+        reason: "valid-child-registry",
+        children: children.filter((child) => !releases.has(child.childKey)),
+        releasedChildren: children.filter((child) => releases.has(child.childKey)),
+        malformed: []
+      };
+}
+
+export function releaseBrokerChild(
+  registration,
+  { child, cleanupOutcome, now = () => new Date().toISOString() } = {}
+) {
+  if (!validRegistrationReference(registration)) {
+    return { released: false, reason: "broker-registration-unavailable" };
+  }
+  const childPath = path.join(registration.registryDir, "children", `${child?.childKey}.json`);
+  if (
+    !validChildRecord(child, childPath, registration) ||
+    cleanupOutcome?.verified !== true ||
+    (cleanupOutcome.survivors?.length ?? 0) > 0 ||
+    (cleanupOutcome.survivorIdentities?.length ?? 0) > 0
+  ) {
+    return { released: false, reason: "child-cleanup-unverified" };
+  }
+  const payload = {
+    version: BROKER_OWNERSHIP_VERSION,
+    kind: "child-release",
+    brokerKey: registration.brokerKey,
+    childKey: child.childKey,
+    pid: child.pid,
+    pidIdentity: child.pidIdentity,
+    cleanupVerified: true,
+    releasedAt: now()
+  };
+  const releasePath = path.join(registration.registryDir, "child-releases", `${child.childKey}.json`);
+  if (fs.existsSync(releasePath)) {
+    const existing = readJson(releasePath);
+    if (!validChildReleaseRecord(existing, releasePath, registration, child)) {
+      const error = new Error(`Invalid existing broker child release at ${releasePath}.`);
+      error.code = "BROKER_OWNERSHIP_COLLISION";
+      throw error;
+    }
+    fs.chmodSync(releasePath, 0o600);
+    return { released: true, path: releasePath, release: existing };
+  }
+  createImmutableJson(releasePath, payload);
+  return { released: true, path: releasePath, release: payload };
+}
+
+export function publishBrokerReaperReceipt(
+  registration,
+  { attemptId, decision, outcomes, residualIdentities, createdAt = new Date().toISOString() }
+) {
+  if (!validRegistrationReference(registration)) {
+    return { published: false, reason: "broker-registration-unavailable" };
+  }
+  if (
+    typeof attemptId !== "string" ||
+    !/^[a-zA-Z0-9._-]{1,128}$/.test(attemptId) ||
+    typeof decision !== "string" ||
+    !Array.isArray(outcomes) ||
+    !Array.isArray(residualIdentities)
+  ) {
+    return { published: false, reason: "receipt-invalid" };
+  }
+  const payload = {
+    version: BROKER_OWNERSHIP_VERSION,
+    kind: "reaper-receipt",
+    brokerKey: registration.brokerKey,
+    attemptId,
+    decision,
+    outcomes,
+    residualIdentities,
+    createdAt
+  };
+  const receiptPath = path.join(registration.registryDir, "receipts", `${attemptId}.json`);
+  createImmutableJson(receiptPath, payload);
+  return { published: true, path: receiptPath, receipt: payload };
+}
+
+export function assessBrokerOwners(registration, { getLiveProcessPidsImpl = getLiveProcessPids } = {}) {
+  if (!validRegistrationReference(registration)) {
+    return { safeToShutdown: false, reason: "broker-registration-unavailable", liveOwners: [], deadOwners: [], releasedOwners: [], malformed: [] };
+  }
+
+  const malformed = [];
+  const owners = [];
+  const releases = new Map();
+  let ownerFiles;
+  let releaseFiles;
+  try {
+    ownerFiles = listJsonFiles(path.join(registration.registryDir, "owners"));
+    releaseFiles = listJsonFiles(path.join(registration.registryDir, "releases"));
+  } catch {
+    return {
+      safeToShutdown: false,
+      reason: "malformed-registry",
+      liveOwners: [],
+      deadOwners: [],
+      releasedOwners: [],
+      malformed: [registration.registryDir]
+    };
+  }
+  for (const filePath of ownerFiles) {
+    try {
+      const record = readJson(filePath);
+      if (!validOwnerRecord(record, filePath, registration)) {
+        malformed.push(filePath);
+      } else {
+        owners.push(record);
+      }
+    } catch {
+      malformed.push(filePath);
+    }
+  }
+  for (const filePath of releaseFiles) {
+    try {
+      const record = readJson(filePath);
+      if (!validReleaseRecord(record, filePath, registration)) {
+        malformed.push(filePath);
+      } else {
+        releases.set(record.ownerKey, record);
+      }
+    } catch {
+      malformed.push(filePath);
+    }
+  }
+  if (malformed.length > 0) {
+    return { safeToShutdown: false, reason: "malformed-registry", liveOwners: [], deadOwners: [], releasedOwners: [], malformed };
+  }
+  if (owners.length === 0) {
+    return { safeToShutdown: false, reason: "no-registered-owner", liveOwners: [], deadOwners: [], releasedOwners: [], malformed: [] };
+  }
+
+  const liveOwners = [];
+  const deadOwners = [];
+  const releasedOwners = [];
+  for (const owner of owners) {
+    const release = releases.get(owner.ownerKey);
+    if (release) {
+      if (
+        release.sessionId !== owner.sessionId ||
+        release.pid !== owner.pid ||
+        release.pidIdentity !== owner.pidIdentity
+      ) {
+        malformed.push(path.join(registration.registryDir, "releases", `${owner.ownerKey}.json`));
+        continue;
+      }
+      releasedOwners.push(owner);
+      continue;
+    }
+    let live;
+    try {
+      live = getLiveProcessPidsImpl([owner.pid], { identities: [owner.pidIdentity] });
+    } catch {
+      malformed.push(`liveness:${owner.ownerKey}`);
+      continue;
+    }
+    if (Array.isArray(live) && live.includes(owner.pid)) {
+      liveOwners.push(owner);
+    } else {
+      deadOwners.push(owner);
+    }
+  }
+  if (malformed.length > 0) {
+    return { safeToShutdown: false, reason: "owner-liveness-unavailable", liveOwners, deadOwners, releasedOwners, malformed };
+  }
+  if (liveOwners.length > 0) {
+    return { safeToShutdown: false, reason: "live-owner", liveOwners, deadOwners, releasedOwners, malformed: [] };
+  }
+  return {
+    safeToShutdown: true,
+    reason: "all-owners-dead-or-released",
+    liveOwners,
+    deadOwners,
+    releasedOwners,
+    malformed: []
+  };
+}
+
+export function publishBrokerChild(registration, options = {}) {
+  const { ownershipSnapshot, now = () => new Date().toISOString() } = options;
+  if (!validRegistrationReference(registration)) {
+    return { registered: false, reason: "broker-registration-unavailable" };
+  }
+  const pid = ownershipSnapshot?.rootPid;
+  const identity = ownershipSnapshot?.rootIdentity;
+  if (!isPidIdentity(pid, identity) || !isSafePid(ownershipSnapshot?.processGroupId) || !Array.isArray(ownershipSnapshot?.members)) {
+    return { registered: false, reason: "child-identity-unavailable" };
+  }
+  const locked = withBrokerRegistryLock(registration, options, () => {
+    const childKey = sha256(identity);
+    const payload = {
+      version: BROKER_OWNERSHIP_VERSION,
+      kind: "child",
+      brokerKey: registration.brokerKey,
+      childKey,
+      pid,
+      pidIdentity: identity,
+      processGroupId: ownershipSnapshot.processGroupId,
+      ownershipSnapshot,
+      registeredAt: now()
+    };
+    const childPath = path.join(registration.registryDir, "children", `${childKey}.json`);
+    if (fs.existsSync(childPath)) {
+      const existing = readJson(childPath);
+      if (
+        existing?.version !== BROKER_OWNERSHIP_VERSION ||
+        existing.kind !== "child" ||
+        existing.brokerKey !== registration.brokerKey ||
+        existing.childKey !== childKey ||
+        existing.pid !== pid ||
+        existing.pidIdentity !== identity ||
+        JSON.stringify(existing.ownershipSnapshot) !== JSON.stringify(ownershipSnapshot)
+      ) {
+        const error = new Error(`Invalid existing broker child row at ${childPath}.`);
+        error.code = "BROKER_OWNERSHIP_COLLISION";
+        throw error;
+      }
+      fs.chmodSync(childPath, 0o600);
+      return { registered: true, childKey, path: childPath, child: existing };
+    }
+    createImmutableJson(childPath, payload);
+    return { registered: true, childKey, path: childPath, child: payload };
+  });
+  return locked.ok ? locked.value : { registered: false, reason: locked.reason };
+}

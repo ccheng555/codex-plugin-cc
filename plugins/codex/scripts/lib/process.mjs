@@ -161,6 +161,26 @@ export function captureProcessOwnership(pid, options = {}) {
   };
 }
 
+export function captureStableSessionOwner(pid = process.pid, options = {}) {
+  if (!Number.isFinite(pid) || (options.platform ?? process.platform) === "win32") {
+    return null;
+  }
+  const processes = readUnixProcessTable(options.runCommandImpl ?? runCommand, options);
+  const current = processes.get(pid);
+  if (!isRunningProcess(current) || current.processGroupId === pid) {
+    return null;
+  }
+  const leader = processes.get(current.processGroupId);
+  if (!isRunningProcess(leader) || leader.pid !== leader.processGroupId) {
+    return null;
+  }
+  return {
+    pid: leader.pid,
+    identity: leader.identity,
+    processGroupId: leader.processGroupId
+  };
+}
+
 function recordsFromOwnershipSnapshot(snapshot) {
   return (snapshot?.members ?? []).filter((record) => {
     return Number.isFinite(record.pid) && typeof record.identity === "string" && record.identity.length > 0;
@@ -338,8 +358,14 @@ function signalVerifiedUnit(unit, signal, processes, killImpl) {
     killImpl(target, signal);
     return true;
   } catch (error) {
-    if (error?.code === "ESRCH") {
+    if (error?.code === "ESRCH" || error?.code === "EPERM") {
+      // On macOS a process-group signal can race the group leader's exit and
+      // return EPERM. Never infer success from the errno; the caller's fresh
+      // process-table poll decides whether cleanup is verified.
       return false;
+    }
+    if (error instanceof Error) {
+      error.message = `Unable to signal owned process ${unit.record.identity} with ${signal} via target ${target}: ${error.message}`;
     }
     throw error;
   }
@@ -390,15 +416,23 @@ function warnProcessCleanup(message, options) {
 }
 
 function degradedDirectChildKill(pid, options, killImpl, reason) {
+  const ownershipSnapshot = options.ownershipSnapshot ?? null;
+  const canSignalOwnedGroup =
+    options.ownerHoldsLiveHandle === true &&
+    ownershipSnapshot?.rootPid === pid &&
+    ownershipSnapshot?.processGroupId === pid &&
+    ownershipSnapshot?.rootIdentity === (options.expectedRootIdentity ?? ownershipSnapshot?.rootIdentity);
   const directKillImpl = options.directKillImpl ?? ((signal) => killImpl(pid, signal));
   let delivered = false;
   try {
-    delivered = directKillImpl("SIGKILL") !== false;
+    delivered = canSignalOwnedGroup
+      ? killImpl(-pid, "SIGKILL") !== false
+      : directKillImpl("SIGKILL") !== false;
   } catch {
     // The direct child may already have exited.
   }
   warnProcessCleanup(
-    `Unable to verify Unix process cleanup for PID ${pid}; used direct-child kill fallback (${String(reason).replace(/\s+/g, " ").trim()}). Surviving PIDs: none known.`,
+    `Unable to verify Unix process cleanup for PID ${pid}; used ${canSignalOwnedGroup ? "process-group" : "direct-child"} kill fallback (${String(reason).replace(/\s+/g, " ").trim()}). Surviving PIDs: none known.`,
     options
   );
   return normalizeProcessCleanupOutcome({
@@ -407,9 +441,13 @@ function degradedDirectChildKill(pid, options, killImpl, reason) {
     verified: false,
     escalated: false,
     degraded: true,
-    method: "direct-child",
-    targets: [pid],
-    targetIdentities: options.expectedRootIdentity ? [options.expectedRootIdentity] : [],
+    method: canSignalOwnedGroup ? "process-group" : "direct-child",
+    targets: canSignalOwnedGroup
+      ? recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.pid)
+      : [pid],
+    targetIdentities: canSignalOwnedGroup
+      ? recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.identity)
+      : options.expectedRootIdentity ? [options.expectedRootIdentity] : [],
     survivors: [],
     survivorIdentities: []
   });
@@ -531,7 +569,8 @@ export async function terminateProcessTree(pid, options = {}) {
   const sortedTracked = () =>
     [...tracked.values()].sort((left, right) => right.depth - left.depth);
   if (!root && listLiveTracked(tracked, initialProcesses).length === 0) {
-    const verified = !options.requireVerifiedOwnership && ownershipEstablished;
+    const degradedWithoutDurableSnapshot = options.priorCleanupDegraded === true && recordsFromOwnershipSnapshot(ownershipSnapshot).length === 0;
+    const verified = !options.requireVerifiedOwnership && ownershipEstablished && !degradedWithoutDurableSnapshot;
     return normalizeProcessCleanupOutcome({
       attempted: true,
       delivered: false,

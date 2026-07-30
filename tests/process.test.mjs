@@ -1,7 +1,52 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { getLiveProcessPids, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { captureStableSessionOwner, getLiveProcessPids, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("captureStableSessionOwner records the hook process-group leader", () => {
+  const owner = captureStableSessionOwner(7101, {
+    platform: "darwin",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: [
+          "7100 1 7100 S Mon Jul 27 00:07:00 2026",
+          "7101 7100 7100 S Mon Jul 27 00:07:01 2026"
+        ].join("\n"),
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.deepEqual(owner, {
+    pid: 7100,
+    identity: "7100@Mon Jul 27 00:07:00 2026",
+    processGroupId: 7100
+  });
+});
+
+test("captureStableSessionOwner refuses a hook that is its own process-group leader", () => {
+  const owner = captureStableSessionOwner(7200, {
+    platform: "darwin",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "7200 1 7200 S Mon Jul 27 00:08:00 2026\n",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.equal(owner, null);
+});
 
 test("terminateProcessTree uses taskkill on Windows", async () => {
   let captured = null;
@@ -143,6 +188,75 @@ test("terminateProcessTree signals a Unix PID directly when it is not a group le
   assert.equal(outcome.method, "process-tree");
 });
 
+test("terminateProcessTree verifies an EPERM group-signal race only after the target disappears", async () => {
+  let scans = 0;
+  const identity = "100@Mon Jul 27 00:00:00 2026";
+  const outcome = await terminateProcessTree(100, {
+    platform: "darwin",
+    expectedRootIdentity: identity,
+    ownershipSnapshot: {
+      rootPid: 100,
+      rootIdentity: identity,
+      processGroupId: 100,
+      members: [{ pid: 100, parentPid: 1, processGroupId: 100, state: "S", startedAt: "Mon Jul 27 00:00:00 2026", identity, depth: 0 }]
+    },
+    runCommandImpl() {
+      scans += 1;
+      return {
+        status: 0,
+        stdout: scans <= 2 ? "100 1 100 S Mon Jul 27 00:00:00 2026\n" : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl() {
+      const error = new Error("kill EPERM");
+      error.code = "EPERM";
+      throw error;
+    },
+    pollIntervalMs: 0,
+    termPollAttempts: 1
+  });
+
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.verified, true);
+  assert.deepEqual(outcome.survivors, []);
+});
+
+test("terminateProcessTree keeps an EPERM group-signal survivor unverified", async () => {
+  const identity = "100@Mon Jul 27 00:00:00 2026";
+  const outcome = await terminateProcessTree(100, {
+    platform: "darwin",
+    expectedRootIdentity: identity,
+    ownershipSnapshot: {
+      rootPid: 100,
+      rootIdentity: identity,
+      processGroupId: 100,
+      members: [{ pid: 100, parentPid: 1, processGroupId: 100, state: "S", startedAt: "Mon Jul 27 00:00:00 2026", identity, depth: 0 }]
+    },
+    runCommandImpl() {
+      return {
+        status: 0,
+        stdout: "100 1 100 S Mon Jul 27 00:00:00 2026\n",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl() {
+      const error = new Error("kill EPERM");
+      error.code = "EPERM";
+      throw error;
+    },
+    pollIntervalMs: 0,
+    termPollAttempts: 1,
+    killPollAttempts: 1
+  });
+
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.verified, false);
+  assert.deepEqual(outcome.survivorIdentities, [identity]);
+});
+
 test("terminateProcessTree parses a captured Linux procps process table", async () => {
   const signals = [];
   const alive = new Set([42001, 42002]);
@@ -214,6 +328,80 @@ test("terminateProcessTree falls back to a direct child kill when Unix process e
   assert.deepEqual(outcome.survivors, []);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /direct-child kill fallback.*none known/i);
+});
+
+test("terminateProcessTree preserves an owned detached group during degraded live-handle cleanup", async () => {
+  const signals = [];
+  const warnings = [];
+  const ownershipSnapshot = {
+    rootPid: 1234,
+    rootIdentity: "1234@Mon Jul 27 00:00:00 2026",
+    processGroupId: 1234,
+    members: [
+      {
+        pid: 1234,
+        parentPid: 1,
+        processGroupId: 1234,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "1234@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      }
+    ]
+  };
+  const outcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    ownershipSnapshot,
+    ownerHoldsLiveHandle: true,
+    warnImpl(message) {
+      warnings.push(message);
+    },
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: "ps denied",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(signals, [[-1234, "SIGKILL"]]);
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
+  assert.equal(outcome.method, "process-group");
+  assert.match(warnings[0], /process-group kill fallback/i);
+});
+
+test("terminateProcessTree does not convert a degraded root-only cleanup into later verified success", async () => {
+  const outcome = await terminateProcessTree(1234, {
+    platform: "darwin",
+    expectedRootIdentity: "1234@Mon Jul 27 00:00:00 2026",
+    priorCleanupDegraded: true,
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl() {
+      throw new Error("an absent root must not be signaled");
+    }
+  });
+
+  assert.equal(outcome.verified, false);
+  assert.equal(outcome.degraded, true);
 });
 
 test("terminateProcessTree refuses a reused root PID", async () => {

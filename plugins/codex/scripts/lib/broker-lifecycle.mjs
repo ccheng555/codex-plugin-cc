@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { publishBrokerRegistration, registerBrokerOwner } from "./broker-ownership.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { captureProcessOwnership } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
@@ -114,6 +115,14 @@ async function isBrokerEndpointReady(endpoint) {
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+    if (existing.registry?.registered === true) {
+      const owner = registerBrokerOwner(existing.registry, { env: options.env ?? process.env });
+      if (owner.registered !== true) {
+        const error = new Error(`Unable to register this session as a shared Codex broker owner (${owner.reason ?? "unknown"}).`);
+        error.code = "BROKER_OWNER_REGISTRATION_FAILED";
+        throw error;
+      }
+    }
     return existing;
   }
 
@@ -189,6 +198,25 @@ export async function ensureBrokerSession(cwd, options = {}) {
     return null;
   }
 
+  let registry = null;
+  try {
+    const candidate = publishBrokerRegistration({
+      cwd,
+      endpoint,
+      pid: child.pid ?? null,
+      ownershipSnapshot,
+      env: options.env ?? process.env
+    });
+    if (candidate.registered === true) {
+      const owner = registerBrokerOwner(candidate, { env: options.env ?? process.env });
+      if (owner.registered === true) {
+        registry = candidate;
+      }
+    }
+  } catch (error) {
+    process.stderr.write(`Warning: unable to publish Codex broker ownership: ${error.message}. Broker remains unregistered.\n`);
+  }
+
   const session = {
     endpoint,
     pidFile,
@@ -197,7 +225,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pid: child.pid ?? null,
     pidIdentity: ownershipSnapshot?.rootIdentity ?? null,
     ownershipSnapshot,
-    ownershipCaptureFailed
+    ownershipCaptureFailed,
+    registry
   };
   saveBrokerSession(cwd, session);
   return session;

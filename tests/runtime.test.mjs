@@ -8,9 +8,10 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir as createTempDir, run } from "./helpers.mjs";
 import { enqueueBackgroundTask, handleCancel, handleTaskWorker } from "../plugins/codex/scripts/codex-companion.mjs";
-import { cleanupSessionJobs } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
+import { cleanupSessionJobs, handleSessionEnd, handleSessionStart } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { isBrokerRequestAllowedDuringShutdown } from "../plugins/codex/scripts/app-server-broker.mjs";
+import { SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
 import { ensureBrokerSession, loadBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
 import { captureProcessOwnership, getProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
@@ -62,6 +63,108 @@ test("broker rejects queued work after shutdown begins", () => {
   assert.equal(isBrokerRequestAllowedDuringShutdown(true, { id: 2, method: "thread/list" }), false);
   assert.equal(isBrokerRequestAllowedDuringShutdown(true, { id: 3, method: "broker/shutdown" }), true);
   assert.equal(isBrokerRequestAllowedDuringShutdown(false, { id: 4, method: "thread/list" }), true);
+});
+
+test("SessionStart exports the stable process-group owner identity", () => {
+  const envFile = path.join(makeTempDir(), "session.env");
+  const previousEnvFile = process.env.CLAUDE_ENV_FILE;
+  process.env.CLAUDE_ENV_FILE = envFile;
+  try {
+    handleSessionStart(
+      {
+        session_id: "session-owner-export",
+        transcript_path: "/tmp/transcript.jsonl",
+        cwd: ROOT
+      },
+      {
+        pid: 7101,
+        platform: "darwin",
+        captureStableSessionOwnerImpl() {
+          return {
+            pid: 7100,
+            identity: "7100@Mon Jul 27 00:07:00 2026",
+            processGroupId: 7100
+          };
+        }
+      }
+    );
+  } finally {
+    if (previousEnvFile == null) {
+      delete process.env.CLAUDE_ENV_FILE;
+    } else {
+      process.env.CLAUDE_ENV_FILE = previousEnvFile;
+    }
+  }
+
+  const source = fs.readFileSync(envFile, "utf8");
+  assert.match(source, /export CODEX_COMPANION_SESSION_ID='session-owner-export'/);
+  assert.match(source, new RegExp(`export ${SESSION_OWNER_PID_ENV}='7100'`));
+  assert.match(source, new RegExp(`export ${SESSION_OWNER_IDENTITY_ENV}='7100@Mon Jul 27 00:07:00 2026'`));
+});
+
+test("SessionEnd leaves a shared broker untouched while another registered owner is live", async () => {
+  const calls = [];
+  await handleSessionEnd(
+    { cwd: ROOT, session_id: "session-ending" },
+    {
+      env: {},
+      loadBrokerSessionImpl() {
+        return {
+          endpoint: "unix:/tmp/shared-broker.sock",
+          pid: 4100,
+          pidIdentity: "4100@Mon Jul 27 00:00:00 2026",
+          registry: {
+            registered: true,
+            version: 1,
+            brokerKey: "a".repeat(64),
+            registryRoot: "/tmp/registry",
+            registryDir: `/tmp/registry/${"a".repeat(64)}`
+          }
+        };
+      },
+      acquireBrokerRegistryLockImpl() {
+        calls.push("acquire-lock");
+        return { acquired: true };
+      },
+      loadBrokerRegistrationImpl() {
+        calls.push("validate-registry");
+        return {
+          registered: true,
+          version: 1,
+          brokerKey: "a".repeat(64),
+          registryRoot: "/tmp/registry",
+          registryDir: `/tmp/registry/${"a".repeat(64)}`
+        };
+      },
+      releaseBrokerOwnerImpl() {
+        calls.push("release-owner");
+        return { released: true };
+      },
+      assessBrokerOwnersImpl() {
+        return { safeToShutdown: false, reason: "live-owner", liveOwners: [{ sessionId: "session-other" }] };
+      },
+      sendBrokerShutdownImpl() {
+        calls.push("shutdown-broker");
+      },
+      cleanupSessionJobsImpl() {
+        calls.push("cleanup-jobs");
+        return { verified: true, failures: [] };
+      },
+      teardownBrokerSessionImpl() {
+        calls.push("teardown-broker");
+        return { verified: true };
+      },
+      clearBrokerSessionImpl() {
+        calls.push("clear-broker");
+      },
+      releaseBrokerRegistryLockImpl() {
+        calls.push("release-lock");
+        return { released: true };
+      }
+    }
+  );
+
+  assert.deepEqual(calls, ["acquire-lock", "validate-registry", "release-owner", "release-lock", "cleanup-jobs"]);
 });
 
 test("detached fixture keepalive self-expires when parent cleanup is skipped", async (t) => {
@@ -422,6 +525,88 @@ test("shared broker reclaims a post-snapshot helper before allowing replacement"
 
   assert.ok(Array.isArray(replacementResponse.data));
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 2);
+});
+
+test("automatic broker registration preserves a shared broker until its final owner releases", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  let ownerIdentity;
+  try {
+    ownerIdentity = getProcessIdentity(process.pid);
+  } catch (error) {
+    if (error?.code === "PROCESS_TABLE_UNAVAILABLE") {
+      t.skip(`process table unavailable: ${error.message}`);
+      return;
+    }
+    throw error;
+  }
+  assert.ok(ownerIdentity);
+
+  const baseEnv = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir,
+    [SESSION_OWNER_PID_ENV]: String(process.pid),
+    [SESSION_OWNER_IDENTITY_ENV]: ownerIdentity
+  };
+  const envA = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "registry-owner-a" };
+  const envB = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "registry-owner-b" };
+  const first = await ensureBrokerSession(repo, { env: envA });
+  if (!first) {
+    t.skip("broker socket unavailable in this sandbox");
+    return;
+  }
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env: envB,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "registry-owner-b" })
+    });
+  });
+
+  assert.equal(first.registry?.registered, true);
+  assert.equal(fs.statSync(path.join(first.registry.registryDir, "broker.json")).mode & 0o777, 0o600);
+  const second = await ensureBrokerSession(repo, { env: envB });
+  assert.equal(second.pid, first.pid);
+  assert.equal(fs.readdirSync(path.join(first.registry.registryDir, "owners")).filter((name) => name.endsWith(".json")).length, 2);
+
+  const client = await CodexAppServerClient.connect(repo, { env: envB });
+  await client.request("thread/list", { cwd: repo });
+  await client.close();
+  await waitFor(() => {
+    const childrenDir = path.join(first.registry.registryDir, "children");
+    return fs.existsSync(childrenDir) && fs.readdirSync(childrenDir).some((name) => name.endsWith(".json"));
+  });
+
+  const firstEnd = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: envA,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "registry-owner-a" })
+  });
+  assert.equal(firstEnd.status, 0, firstEnd.stderr);
+  assert.ok(loadBrokerSession(repo));
+  assert.doesNotThrow(() => process.kill(first.pid, 0));
+
+  const finalEnd = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: envB,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "registry-owner-b" })
+  });
+  assert.equal(finalEnd.status, 0, finalEnd.stderr);
+  assert.equal(loadBrokerSession(repo), null);
+  await waitFor(() => {
+    try {
+      process.kill(first.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
 });
 
 test("direct app-server reclaims a post-snapshot helper after its child crashes", async (t) => {
@@ -1247,7 +1432,7 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
   assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
 });
 
-test("session start hook exports the Claude session id, transcript path, and plugin data dir", () => {
+test("session start hook exports session context and a stable owner when available", () => {
   const repo = makeTempDir();
   const envFile = path.join(makeTempDir(), "claude-env.sh");
   fs.writeFileSync(envFile, "", "utf8");
@@ -1270,10 +1455,14 @@ test("session start hook exports the Claude session id, transcript path, and plu
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(
-    fs.readFileSync(envFile, "utf8"),
-    `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
-  );
+  const exported = fs.readFileSync(envFile, "utf8");
+  assert.match(exported, /export CODEX_COMPANION_SESSION_ID='sess-current'/);
+  assert.match(exported, new RegExp(`export CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`));
+  assert.match(exported, new RegExp(`export CLAUDE_PLUGIN_DATA='${pluginDataDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`));
+  if (process.platform !== "win32") {
+    assert.match(exported, /export CODEX_COMPANION_SESSION_OWNER_PID='\d+'/);
+    assert.match(exported, /export CODEX_COMPANION_SESSION_OWNER_IDENTITY='\d+@[^']+'/);
+  }
 });
 
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
@@ -2710,10 +2899,15 @@ test("unverified cleanup preserves cancel, session, and broker ownership records
   assert.equal(state.jobs[0].pid, 123);
   assert.deepEqual(state.jobs[0].cleanupOutcome.survivorIdentities, ["123@old"]);
 
+  let sessionCleanupOptions;
   const sessionCleanup = await cleanupSessionJobs(workspace, "sess-current", {
-    terminateProcessTreeImpl: async () => cleanupOutcome
+    terminateProcessTreeImpl: async (_pid, options) => {
+      sessionCleanupOptions = options;
+      return cleanupOutcome;
+    }
   });
   assert.equal(sessionCleanup.verified, false);
+  assert.equal(sessionCleanupOptions.priorCleanupDegraded, true);
   state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.equal(state.jobs[0].pid, 123);
   assert.equal(fs.existsSync(jobFile), true);

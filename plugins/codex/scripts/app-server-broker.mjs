@@ -8,8 +8,9 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { loadBrokerRegistration, publishBrokerChild, releaseBrokerChild } from "./lib/broker-ownership.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { getLiveProcessPids } from "./lib/process.mjs";
+import { getLiveProcessPids, getProcessIdentity } from "./lib/process.mjs";
 
 const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -94,6 +95,7 @@ async function main() {
 
   const childIdleMs = resolveChildIdleMs();
   let appClient = null;
+  let appClientRegistryChild = null;
   let appClientStartPromise = null;
   let appClientClosePromise = null;
   let childIdleTimer = null;
@@ -110,7 +112,26 @@ async function main() {
   let activeStreamTurn = 0;
   let streamTurnCounter = 0;
   let blockedCleanup = null;
+  let brokerRegistration = null;
   const sockets = new Set();
+
+  function getBrokerRegistration() {
+    if (brokerRegistration?.registered === true) {
+      return brokerRegistration;
+    }
+    try {
+      const brokerIdentity = getProcessIdentity(process.pid);
+      if (brokerIdentity) {
+        const candidate = loadBrokerRegistration({ endpoint, brokerIdentity });
+        if (candidate.registered === true) {
+          brokerRegistration = candidate;
+        }
+      }
+    } catch {
+      // Missing registry evidence keeps the child outside automated cleanup.
+    }
+    return brokerRegistration;
+  }
 
   function cancelChildIdleClose() {
     if (childIdleTimer) {
@@ -151,6 +172,24 @@ async function main() {
     );
   }
 
+  function recordVerifiedChildRelease(client, child) {
+    const registration = getBrokerRegistration();
+    if (registration?.registered !== true || !child || client.cleanupOutcome?.verified !== true) {
+      return;
+    }
+    try {
+      const released = releaseBrokerChild(registration, {
+        child,
+        cleanupOutcome: client.cleanupOutcome
+      });
+      if (released.released !== true) {
+        process.stderr.write(`Warning: unable to release shared Codex app-server ownership (${released.reason ?? "unknown"}).\n`);
+      }
+    } catch (error) {
+      process.stderr.write(`Warning: unable to release shared Codex app-server ownership: ${error.message}.\n`);
+    }
+  }
+
   async function closeAppClient() {
     cancelChildIdleClose();
     clearStreamState();
@@ -162,7 +201,9 @@ async function main() {
       return;
     }
     const client = appClient;
+    const registryChild = appClientRegistryChild;
     appClient = null;
+    appClientRegistryChild = null;
     if (!client) {
       return;
     }
@@ -170,6 +211,7 @@ async function main() {
       .close()
       .then(() => {
         recordUnverifiedCleanup(client);
+        recordVerifiedChildRelease(client, registryChild);
       })
       .catch((error) => {
         blockedCleanup = { degraded: true, survivors: [] };
@@ -272,14 +314,38 @@ async function main() {
     }
     if (!appClientStartPromise) {
       appClientStartPromise = CodexAppServerClient.connect(cwd, { disableBroker: true })
-        .then((client) => {
+        .then(async (client) => {
+          const registration = getBrokerRegistration();
+          let childRegistration = null;
+          if (registration?.registered === true) {
+            try {
+              childRegistration = client.ownershipSnapshot
+                ? publishBrokerChild(registration, { ownershipSnapshot: client.ownershipSnapshot })
+                : { registered: false, reason: "child-identity-unavailable" };
+            } catch (error) {
+              await client.close().catch(() => {});
+              throw error;
+            }
+            if (childRegistration.registered !== true) {
+              await client.close().catch(() => {});
+              const error = new Error(`Unable to register shared Codex app-server ownership (${childRegistration.reason ?? "unknown"}).`);
+              error.rpcCode = BROKER_SHUTDOWN_RPC_CODE;
+              throw error;
+            }
+          }
+          let registryChild = null;
           appClient = client;
+          if (registration?.registered === true) {
+            registryChild = childRegistration.child;
+            appClientRegistryChild = registryChild;
+          }
           client.setNotificationHandler(routeNotification);
           const childPid = client.proc?.pid ?? null;
           client.setExitHandler(() => {
             clearStreamState();
             if (appClient === client) {
               appClient = null;
+              appClientRegistryChild = null;
             }
             if (!client.closed && childPid != null && process.platform !== "win32") {
               // The child is a detached process-group leader; on an unexpected
@@ -290,6 +356,7 @@ async function main() {
                 .waitForUnexpectedExitCleanup()
                 ?.then(() => {
                   recordUnverifiedCleanup(client);
+                  recordVerifiedChildRelease(client, registryChild);
                 })
                 .catch((error) => {
                   blockedCleanup = { degraded: true, survivors: [] };

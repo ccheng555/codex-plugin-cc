@@ -4,8 +4,17 @@ import fs from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-import { terminateProcessTree } from "./lib/process.mjs";
+import { captureStableSessionOwner, terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
+import {
+  acquireBrokerRegistryLock,
+  assessBrokerOwners,
+  loadBrokerRegistration,
+  releaseBrokerOwner,
+  releaseBrokerRegistryLock,
+  SESSION_OWNER_IDENTITY_ENV,
+  SESSION_OWNER_PID_ENV
+} from "./lib/broker-ownership.mjs";
 import {
   clearBrokerSession,
   LOG_FILE_ENV,
@@ -76,7 +85,8 @@ export async function cleanupSessionJobs(cwd, sessionId, dependencies = {}) {
       const outcome = await terminate(job.pid ?? Number.NaN, {
         expectedRootIdentity,
         ownershipSnapshot: null,
-        requireVerifiedOwnership: ownershipCaptureFailed
+        requireVerifiedOwnership: ownershipCaptureFailed,
+        priorCleanupDegraded: job.cleanupOutcome?.degraded === true
       });
       if (outcome?.verified === true) {
         continue;
@@ -126,16 +136,34 @@ export async function cleanupSessionJobs(cwd, sessionId, dependencies = {}) {
   return { verified: retainedJobs.length === 0, failures: [] };
 }
 
-function handleSessionStart(input) {
+export function handleSessionStart(input, dependencies = {}) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  if ((dependencies.platform ?? process.platform) === "win32") {
+    return;
+  }
+  try {
+    const captureOwner = dependencies.captureStableSessionOwnerImpl ?? captureStableSessionOwner;
+    const owner = captureOwner(dependencies.pid ?? process.pid, {
+      cwd: input.cwd || process.cwd(),
+      env: process.env,
+      platform: dependencies.platform
+    });
+    if (owner?.pid && owner.identity) {
+      appendEnvVar(SESSION_OWNER_PID_ENV, owner.pid);
+      appendEnvVar(SESSION_OWNER_IDENTITY_ENV, owner.identity);
+    }
+  } catch {
+    // Missing owner identity leaves this session in the report-only class.
+  }
 }
 
-async function handleSessionEnd(input) {
+export async function handleSessionEnd(input, dependencies = {}) {
   const cwd = input.cwd || process.cwd();
+  const loadBroker = dependencies.loadBrokerSessionImpl ?? loadBrokerSession;
   const brokerSession =
-    loadBrokerSession(cwd) ??
+    loadBroker(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]
       ? {
           endpoint: process.env[BROKER_ENDPOINT_ENV],
@@ -151,31 +179,110 @@ async function handleSessionEnd(input) {
   const pidIdentity = brokerSession?.pidIdentity ?? null;
   const ownershipSnapshot = brokerSession?.ownershipSnapshot ?? null;
   const requireVerifiedOwnership = brokerSession?.ownershipCaptureFailed === true;
+  const registry = brokerSession?.registry?.registered === true ? brokerSession.registry : null;
+  let registryAssessment = null;
+  let registryLock = null;
 
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
+  if (registry) {
+    const acquireRegistryLock = dependencies.acquireBrokerRegistryLockImpl ?? acquireBrokerRegistryLock;
+    registryLock = acquireRegistryLock(registry);
+    if (registryLock?.acquired === true) {
+      const loadRegistration = dependencies.loadBrokerRegistrationImpl ?? loadBrokerRegistration;
+      const lockedRegistration = loadRegistration({
+        endpoint: brokerEndpoint,
+        brokerIdentity: pidIdentity,
+        env: dependencies.env ?? process.env
+      });
+      if (
+        lockedRegistration?.registered !== true ||
+        lockedRegistration.brokerKey !== registry.brokerKey ||
+        lockedRegistration.registryDir !== registry.registryDir
+      ) {
+        registryAssessment = {
+          safeToShutdown: false,
+          reason: "broker-record-invalid",
+          liveOwners: [],
+          deadOwners: [],
+          releasedOwners: [],
+          malformed: [registry.registryDir]
+        };
+      } else {
+        const releaseOwner = dependencies.releaseBrokerOwnerImpl ?? releaseBrokerOwner;
+        const assessOwners = dependencies.assessBrokerOwnersImpl ?? assessBrokerOwners;
+        const ownerRelease = releaseOwner(lockedRegistration, {
+          env: dependencies.env ?? process.env,
+          registryLock
+        });
+        registryAssessment = ownerRelease?.released === true
+          ? assessOwners(lockedRegistration)
+          : {
+              safeToShutdown: false,
+              reason: `owner-release-${ownerRelease?.reason ?? "failed"}`,
+              liveOwners: [],
+              deadOwners: [],
+              releasedOwners: [],
+              malformed: []
+            };
+      }
+    } else {
+      registryAssessment = {
+        safeToShutdown: false,
+        reason: registryLock?.reason ?? "registry-busy",
+        liveOwners: [],
+        deadOwners: [],
+        releasedOwners: [],
+        malformed: []
+      };
+    }
   }
 
-  const jobCleanup = await cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  const brokerCleanup = await teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    pidIdentity,
-    ownershipSnapshot,
-    requireVerifiedOwnership,
-    killProcess: terminateProcessTree
-  });
-  if (brokerCleanup?.verified === true) {
-    clearBrokerSession(cwd);
+  const brokerShutdownAllowed = !registry || registryAssessment?.safeToShutdown === true;
+  let brokerCleanup = { verified: true };
+  let registryLockReleaseFailure = null;
+  try {
+    if (brokerEndpoint && brokerShutdownAllowed) {
+      await (dependencies.sendBrokerShutdownImpl ?? sendBrokerShutdown)(brokerEndpoint);
+    }
+    if (brokerShutdownAllowed) {
+      const teardownBroker = dependencies.teardownBrokerSessionImpl ?? teardownBrokerSession;
+      brokerCleanup = await teardownBroker({
+        endpoint: brokerEndpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid,
+        pidIdentity,
+        ownershipSnapshot,
+        requireVerifiedOwnership,
+        killProcess: dependencies.terminateProcessTreeImpl ?? terminateProcessTree
+      });
+      if (brokerCleanup?.verified === true) {
+        (dependencies.clearBrokerSessionImpl ?? clearBrokerSession)(cwd);
+      }
+    }
+  } finally {
+    if (registry && registryLock?.acquired === true) {
+      const releaseRegistryLock = dependencies.releaseBrokerRegistryLockImpl ?? releaseBrokerRegistryLock;
+      const released = releaseRegistryLock(registry, registryLock);
+      if (released?.released !== true) {
+        registryLockReleaseFailure = released?.reason ?? "unknown";
+      }
+    }
+  }
+
+  const cleanupJobs = dependencies.cleanupSessionJobsImpl ?? cleanupSessionJobs;
+  const jobCleanup = await cleanupJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  if (registryLockReleaseFailure) {
+    throw new Error(`Broker registry lock release failed (${registryLockReleaseFailure}).`);
   }
   if (jobCleanup?.verified !== true) {
     throw new Error("Session cleanup remains pending because process termination could not be verified.");
   }
   if (brokerCleanup?.verified !== true) {
     throw new Error("Broker cleanup remains pending because process termination could not be verified.");
+  }
+  if (registry && !brokerShutdownAllowed && registryAssessment?.reason !== "live-owner") {
+    throw new Error(`Broker cleanup remains report-only because registered ownership is ambiguous (${registryAssessment?.reason ?? "unknown"}).`);
   }
 }
 
