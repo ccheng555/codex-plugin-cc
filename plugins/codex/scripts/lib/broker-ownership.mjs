@@ -13,6 +13,7 @@ const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const REGISTRY_DIR_NAME = "broker-ownership-v1";
 const REGISTRY_LOCK_DIR_NAME = "registry.lock";
+const TERMINAL_FILE_NAME = "terminal.json";
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -346,6 +347,41 @@ export function loadBrokerRegistration({ endpoint, brokerIdentity, env = process
   }
 }
 
+function validBrokerTerminal(record, filePath, registration) {
+  return Boolean(
+    record?.version === BROKER_OWNERSHIP_VERSION &&
+      record.kind === "terminal" &&
+      record.brokerKey === registration.brokerKey &&
+      record.pidIdentity === registration.broker?.pidIdentity &&
+      record.decision === "cleanup-verified" &&
+      typeof record.attemptId === "string" &&
+      /^[a-zA-Z0-9._-]{1,128}$/.test(record.attemptId) &&
+      record.receipt === `${record.attemptId}.json` &&
+      typeof record.retiredAt === "string" &&
+      record.retiredAt.length > 0 &&
+      filePath === path.join(registration.registryDir, TERMINAL_FILE_NAME)
+  );
+}
+
+export function loadBrokerTerminal(registration) {
+  if (!validRegistrationReference(registration)) {
+    return { terminal: false, reason: "broker-registration-unavailable" };
+  }
+  const terminalPath = path.join(registration.registryDir, TERMINAL_FILE_NAME);
+  if (!fs.existsSync(terminalPath)) {
+    return { terminal: false, reason: "terminal-absent", path: terminalPath };
+  }
+  try {
+    const record = readJson(terminalPath);
+    if (!validBrokerTerminal(record, terminalPath, registration)) {
+      return { terminal: false, reason: "terminal-invalid", path: terminalPath };
+    }
+    return { terminal: true, reason: "cleanup-verified", path: terminalPath, record };
+  } catch {
+    return { terminal: false, reason: "terminal-invalid", path: terminalPath };
+  }
+}
+
 export function publishBrokerRegistration({ cwd, endpoint, pid, ownershipSnapshot, env = process.env, now = () => new Date().toISOString() }) {
   const registryRoot = resolveBrokerOwnershipRoot(env);
   if (!registryRoot) {
@@ -624,6 +660,7 @@ function validSnapshotMember(record) {
       Number.isSafeInteger(record.parentPid) &&
       record.parentPid >= 0 &&
       isSafePid(record.processGroupId) &&
+      (record.sessionId == null || isSafePid(record.sessionId)) &&
       typeof record.state === "string" &&
       record.state.length > 0 &&
       typeof record.startedAt === "string" &&
@@ -648,11 +685,65 @@ function validChildRecord(record, filePath, registration) {
       snapshot?.rootPid === record.pid &&
       snapshot.rootIdentity === record.pidIdentity &&
       snapshot.processGroupId === record.processGroupId &&
+      (snapshot.sessionId == null ||
+        (isSafePid(snapshot.sessionId) &&
+          snapshot.sessionId === snapshot.rootPid)) &&
       Array.isArray(snapshot.members) &&
       snapshot.members.length > 0 &&
       snapshot.members.every(validSnapshotMember) &&
-      snapshot.members.some((member) => member.pid === record.pid && member.identity === record.pidIdentity)
+      snapshot.members.some(
+        (member) =>
+          member.pid === record.pid &&
+          member.identity === record.pidIdentity &&
+          (snapshot.sessionId == null || member.sessionId === snapshot.sessionId)
+      )
   );
+}
+
+function validChildObservation(record, filePath, registration, child) {
+  const snapshot = record?.ownershipSnapshot;
+  return Boolean(
+    child &&
+      record?.version === BROKER_OWNERSHIP_VERSION &&
+      record.kind === "child-observation" &&
+      record.brokerKey === registration.brokerKey &&
+      record.childKey === child.childKey &&
+      typeof record.observationKey === "string" &&
+      record.observationKey === sha256(JSON.stringify(snapshot)) &&
+      path.basename(filePath) === `${record.observationKey}.json` &&
+      snapshot?.rootPid === child.pid &&
+      snapshot.rootIdentity === child.pidIdentity &&
+      snapshot.processGroupId === child.processGroupId &&
+      (snapshot.sessionId == null ||
+        (isSafePid(snapshot.sessionId) && snapshot.sessionId === snapshot.rootPid)) &&
+      Array.isArray(snapshot.members) &&
+      snapshot.members.length > 0 &&
+      snapshot.members.every(validSnapshotMember) &&
+      snapshot.members.some(
+        (member) =>
+          member.pid === child.pid &&
+          member.identity === child.pidIdentity &&
+          (snapshot.sessionId == null || member.sessionId === snapshot.sessionId)
+      ) &&
+      typeof record.observedAt === "string" &&
+      record.observedAt.length > 0
+  );
+}
+
+function mergeChildOwnership(child, observations) {
+  const members = new Map();
+  for (const snapshot of [child.ownershipSnapshot, ...observations.map((observation) => observation.ownershipSnapshot)]) {
+    for (const member of snapshot.members) {
+      members.set(member.identity, member);
+    }
+  }
+  return {
+    ...child,
+    ownershipSnapshot: {
+      ...child.ownershipSnapshot,
+      members: [...members.values()]
+    }
+  };
 }
 
 function validChildReleaseRecord(record, filePath, registration, child) {
@@ -702,7 +793,28 @@ export function loadBrokerChildren(registration) {
       malformed.push(filePath);
     }
   }
-  const childrenByKey = new Map(children.map((child) => [child.childKey, child]));
+  const observedChildren = [];
+  for (const child of children) {
+    const observationDir = path.join(registration.registryDir, "child-observations", child.childKey);
+    const observations = [];
+    if (fs.existsSync(observationDir)) {
+      try {
+        requirePrivateDirectory(observationDir);
+        for (const filePath of listJsonFiles(observationDir)) {
+          const observation = readJson(filePath);
+          if (!validChildObservation(observation, filePath, registration, child)) {
+            malformed.push(filePath);
+          } else {
+            observations.push(observation);
+          }
+        }
+      } catch {
+        malformed.push(observationDir);
+      }
+    }
+    observedChildren.push(mergeChildOwnership(child, observations));
+  }
+  const childrenByKey = new Map(observedChildren.map((child) => [child.childKey, child]));
   for (const filePath of childReleaseFiles) {
     try {
       const record = readJson(filePath);
@@ -720,8 +832,8 @@ export function loadBrokerChildren(registration) {
     : {
         valid: true,
         reason: "valid-child-registry",
-        children: children.filter((child) => !releases.has(child.childKey)),
-        releasedChildren: children.filter((child) => releases.has(child.childKey)),
+        children: observedChildren.filter((child) => !releases.has(child.childKey)),
+        releasedChildren: observedChildren.filter((child) => releases.has(child.childKey)),
         malformed: []
       };
 }
@@ -735,8 +847,16 @@ export function releaseBrokerChild(
     return { released: false, reason: "broker-registration-unavailable" };
   }
   const childPath = path.join(registration.registryDir, "children", `${child?.childKey}.json`);
+  let persistedChild;
+  try {
+    persistedChild = readJson(childPath);
+  } catch {
+    return { released: false, reason: "child-cleanup-unverified" };
+  }
   if (
-    !validChildRecord(child, childPath, registration) ||
+    !validChildRecord(persistedChild, childPath, registration) ||
+    child?.childKey !== persistedChild.childKey ||
+    child?.pidIdentity !== persistedChild.pidIdentity ||
     cleanupOutcome?.verified !== true ||
     (cleanupOutcome.survivors?.length ?? 0) > 0 ||
     (cleanupOutcome.survivorIdentities?.length ?? 0) > 0
@@ -800,6 +920,58 @@ export function publishBrokerReaperReceipt(
   const receiptPath = path.join(registration.registryDir, "receipts", `${attemptId}.json`);
   createImmutableJson(receiptPath, payload);
   return { published: true, path: receiptPath, receipt: payload };
+}
+
+export function publishBrokerTerminal(
+  registration,
+  { attemptId, receiptPath, retiredAt = new Date().toISOString(), registryLock }
+) {
+  if (!validRegistrationReference(registration)) {
+    return { terminal: false, reason: "broker-registration-unavailable" };
+  }
+  const expectedReceiptPath = path.join(registration.registryDir, "receipts", `${attemptId}.json`);
+  if (
+    typeof attemptId !== "string" ||
+    !/^[a-zA-Z0-9._-]{1,128}$/.test(attemptId) ||
+    receiptPath !== expectedReceiptPath ||
+    typeof retiredAt !== "string" ||
+    retiredAt.length === 0
+  ) {
+    return { terminal: false, reason: "terminal-invalid" };
+  }
+  let receipt;
+  try {
+    receipt = readJson(receiptPath);
+  } catch {
+    return { terminal: false, reason: "terminal-receipt-unavailable" };
+  }
+  if (
+    receipt?.version !== BROKER_OWNERSHIP_VERSION ||
+    receipt.kind !== "reaper-receipt" ||
+    receipt.brokerKey !== registration.brokerKey ||
+    receipt.attemptId !== attemptId ||
+    receipt.decision !== "cleanup-verified" ||
+    !Array.isArray(receipt.residualIdentities) ||
+    receipt.residualIdentities.length !== 0
+  ) {
+    return { terminal: false, reason: "terminal-receipt-invalid" };
+  }
+  const terminalPath = path.join(registration.registryDir, TERMINAL_FILE_NAME);
+  const payload = {
+    version: BROKER_OWNERSHIP_VERSION,
+    kind: "terminal",
+    brokerKey: registration.brokerKey,
+    pidIdentity: registration.broker.pidIdentity,
+    decision: "cleanup-verified",
+    attemptId,
+    receipt: path.basename(receiptPath),
+    retiredAt
+  };
+  const locked = withBrokerRegistryLock(registration, { registryLock }, () => {
+    createImmutableJson(terminalPath, payload);
+    return { terminal: true, reason: "cleanup-verified", path: terminalPath, record: payload };
+  });
+  return locked.ok ? locked.value : { terminal: false, reason: locked.reason };
 }
 
 export function assessBrokerOwners(registration, { getLiveProcessPidsImpl = getLiveProcessPids } = {}) {
@@ -909,7 +1081,13 @@ export function publishBrokerChild(registration, options = {}) {
   }
   const pid = ownershipSnapshot?.rootPid;
   const identity = ownershipSnapshot?.rootIdentity;
-  if (!isPidIdentity(pid, identity) || !isSafePid(ownershipSnapshot?.processGroupId) || !Array.isArray(ownershipSnapshot?.members)) {
+  if (
+    !isPidIdentity(pid, identity) ||
+    !isSafePid(ownershipSnapshot?.processGroupId) ||
+    (ownershipSnapshot?.sessionId != null &&
+      (!isSafePid(ownershipSnapshot.sessionId) || ownershipSnapshot.sessionId !== pid)) ||
+    !Array.isArray(ownershipSnapshot?.members)
+  ) {
     return { registered: false, reason: "child-identity-unavailable" };
   }
   const locked = withBrokerRegistryLock(registration, options, () => {
@@ -948,4 +1126,68 @@ export function publishBrokerChild(registration, options = {}) {
     return { registered: true, childKey, path: childPath, child: payload };
   });
   return locked.ok ? locked.value : { registered: false, reason: locked.reason };
+}
+
+export function publishBrokerChildObservation(registration, options = {}) {
+  const {
+    child,
+    ownershipSnapshot,
+    now = () => new Date().toISOString()
+  } = options;
+  if (!validRegistrationReference(registration)) {
+    return { observed: false, reason: "broker-registration-unavailable" };
+  }
+  const childPath = path.join(registration.registryDir, "children", `${child?.childKey}.json`);
+  const locked = withBrokerRegistryLock(registration, options, () => {
+    const persistedChild = readJson(childPath);
+    if (
+      !validChildRecord(persistedChild, childPath, registration) ||
+      child?.childKey !== persistedChild.childKey ||
+      child?.pidIdentity !== persistedChild.pidIdentity
+    ) {
+      return { observed: false, reason: "child-registration-invalid" };
+    }
+    const observationKey = sha256(JSON.stringify(ownershipSnapshot));
+    const payload = {
+      version: BROKER_OWNERSHIP_VERSION,
+      kind: "child-observation",
+      brokerKey: registration.brokerKey,
+      childKey: persistedChild.childKey,
+      observationKey,
+      ownershipSnapshot,
+      observedAt: now()
+    };
+    const observationPath = path.join(
+      registration.registryDir,
+      "child-observations",
+      persistedChild.childKey,
+      `${observationKey}.json`
+    );
+    if (fs.existsSync(observationPath)) {
+      const existing = readJson(observationPath);
+      if (!validChildObservation(existing, observationPath, registration, persistedChild)) {
+        return { observed: false, reason: "child-observation-invalid" };
+      }
+      return {
+        observed: true,
+        reason: "child-already-observed",
+        path: observationPath,
+        observation: existing,
+        child: mergeChildOwnership(persistedChild, [existing])
+      };
+    }
+    if (!validChildObservation(payload, observationPath, registration, persistedChild)) {
+      return { observed: false, reason: "child-observation-invalid" };
+    }
+    createImmutableJson(observationPath, payload);
+    const observedChild = mergeChildOwnership(persistedChild, [payload]);
+    return {
+      observed: true,
+      reason: "child-observed",
+      path: observationPath,
+      observation: payload,
+      child: observedChild
+    };
+  });
+  return locked.ok ? locked.value : { observed: false, reason: locked.reason };
 }

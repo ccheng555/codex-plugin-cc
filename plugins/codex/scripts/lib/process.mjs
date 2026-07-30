@@ -54,7 +54,7 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
-const UNIX_PROCESS_TABLE_ARGS = ["-axo", "pid=,ppid=,pgid=,stat=,lstart="];
+const UNIX_PROCESS_TABLE_ARGS = ["-axo", "pid=,ppid=,pgid=,sess=,stat=,lstart="];
 const UNIX_PS_COMMAND = "/bin/ps";
 const UNIX_PS_PATH_COMMAND = "ps";
 
@@ -86,22 +86,39 @@ function readUnixProcessTable(runCommandImpl, options = {}) {
     if (!trimmedLine) {
       continue;
     }
-    const match = trimmedLine.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
-    if (!match) {
+    const match = trimmedLine.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+    const legacyMatch = match ? null : trimmedLine.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+    const parsed = match ?? legacyMatch;
+    if (!parsed) {
       throw createProcessTableError(`Unable to parse Unix process table line: ${trimmedLine}`);
     }
-    const pid = Number(match[1]);
-    const parentPid = Number(match[2]);
-    const processGroupId = Number(match[3]);
-    const state = match[4];
-    const startedAt = match[5].trim();
-    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(parentPid) || !Number.isSafeInteger(processGroupId) || !startedAt) {
+    const pid = Number(parsed[1]);
+    const parentPid = Number(parsed[2]);
+    const processGroupId = Number(parsed[3]);
+    const parsedSessionId = match ? Number(parsed[4]) : null;
+    // Darwin's `sess` is the security audit session, not the POSIX process
+    // session used for containment. Never treat it as a child-tree boundary.
+    const sessionId =
+      (options.platform ?? process.platform) !== "darwin" &&
+      Number.isSafeInteger(parsedSessionId) &&
+      parsedSessionId > 1
+        ? parsedSessionId
+        : null;
+    const state = parsed[match ? 5 : 4];
+    const startedAt = parsed[match ? 6 : 5].trim();
+    if (
+      !Number.isSafeInteger(pid) ||
+      !Number.isSafeInteger(parentPid) ||
+      !Number.isSafeInteger(processGroupId) ||
+      !startedAt
+    ) {
       throw createProcessTableError(`Unable to parse Unix process table line: ${trimmedLine}`);
     }
     processes.set(pid, {
       pid,
       parentPid,
       processGroupId,
+      sessionId,
       state,
       startedAt,
       identity: `${pid}@${startedAt}`
@@ -157,6 +174,7 @@ export function captureProcessOwnership(pid, options = {}) {
     rootPid: root.pid,
     rootIdentity: root.identity,
     processGroupId: root.processGroupId,
+    sessionId: root.sessionId,
     members: collectProcessTree(pid, processes).map((record) => ({ ...record }))
   };
 }
@@ -716,6 +734,13 @@ export async function terminateProcessGroup(pgid, options = {}) {
   const tracked = new Map();
   const ownershipSnapshot = options.ownershipSnapshot ?? null;
   const ownershipEstablished = Boolean(ownershipSnapshot);
+  const ownershipSessionId =
+    Number.isSafeInteger(ownershipSnapshot?.sessionId) &&
+    ownershipSnapshot.sessionId > 1 &&
+    ownershipSnapshot.rootPid === ownershipSnapshot.sessionId
+      ? ownershipSnapshot.sessionId
+      : null;
+  const cleanupMethod = ownershipSessionId ? "process-session" : "process-group";
   // If a live process holds this group id but is not the root we recorded, the
   // id has been reused and nothing in the group is ours. Refuse before
   // admitting any member: members of an unrelated group are absent from the
@@ -731,7 +756,20 @@ export async function terminateProcessGroup(pgid, options = {}) {
       verified: false,
       degraded: true,
       identityMismatch: true,
-      method: "process-group",
+      method: cleanupMethod,
+      survivors: recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.pid),
+      survivorIdentities: recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.identity)
+    });
+  }
+  const sessionLeader = ownershipSessionId ? processes.get(ownershipSessionId) : null;
+  if (ownershipSessionId && sessionLeader && sessionLeader.identity !== ownershipSnapshot.rootIdentity) {
+    return normalizeProcessCleanupOutcome({
+      attempted: false,
+      delivered: false,
+      verified: false,
+      degraded: true,
+      identityMismatch: true,
+      method: cleanupMethod,
       survivors: recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.pid),
       survivorIdentities: recordsFromOwnershipSnapshot(ownershipSnapshot).map((record) => record.identity)
     });
@@ -739,21 +777,25 @@ export async function terminateProcessGroup(pgid, options = {}) {
   for (const record of recordsFromOwnershipSnapshot(ownershipSnapshot)) {
     tracked.set(record.identity, record);
   }
-  let groupMembersFound = false;
-  let groupSelectionFound = false;
+  let ownershipScopeMembersFound = false;
+  let ownershipSelectionFound = false;
   for (const record of processes.values()) {
-    if (record.processGroupId !== pgid || !isRunningProcess(record)) {
+    const inOwnedScope =
+      record.processGroupId === pgid ||
+      (ownershipSessionId !== null && record.sessionId === ownershipSessionId);
+    if (!inOwnedScope || !isRunningProcess(record)) {
       continue;
     }
-    groupMembersFound = true;
+    ownershipScopeMembersFound = true;
     const snapshotRecord = recordsFromOwnershipSnapshot(ownershipSnapshot).find((candidate) => candidate.pid === record.pid);
     if (ownershipSnapshot && snapshotRecord && snapshotRecord.identity !== record.identity) {
       continue;
     }
-    groupSelectionFound = true;
-    if (record.processGroupId === pgid && isRunningProcess(record)) {
-      tracked.set(record.identity, record);
-    }
+    ownershipSelectionFound = true;
+    tracked.set(record.identity, {
+      ...record,
+      depth: Number.isSafeInteger(record.depth) ? record.depth : record.pid === pgid ? 0 : 1
+    });
   }
   if (tracked.size === 0) {
     return normalizeProcessCleanupOutcome({
@@ -786,14 +828,14 @@ export async function terminateProcessGroup(pgid, options = {}) {
     }
     const root = processes.get(pgid);
     const rootIdentityMatches = !root || root.identity === ownershipSnapshot?.rootIdentity;
-    const ownedGroupAccountedFor = groupSelectionFound || !groupMembersFound;
+    const ownedScopeAccountedFor = ownershipSelectionFound || !ownershipScopeMembersFound;
     return normalizeProcessCleanupOutcome({
       attempted: true,
       delivered,
-      verified: live.length === 0 && (!ownershipEstablished || (rootIdentityMatches && ownedGroupAccountedFor)),
-      degraded: ownershipEstablished && (!rootIdentityMatches || !ownedGroupAccountedFor),
+      verified: live.length === 0 && (!ownershipEstablished || (rootIdentityMatches && ownedScopeAccountedFor)),
+      degraded: ownershipEstablished && (!rootIdentityMatches || !ownedScopeAccountedFor),
       escalated,
-      method: "process-group",
+      method: cleanupMethod,
       targets: [...tracked.values()].map((record) => record.pid),
       targetIdentities: [...tracked.values()].map((record) => record.identity),
       survivors: live.map((record) => record.pid),

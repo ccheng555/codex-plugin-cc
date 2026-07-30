@@ -288,7 +288,7 @@ if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-chil
     bootState.helperPids = [...(bootState.helperPids || []), helper.pid];
   }
 }
-if (BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "crash-with-post-snapshot-helper") {
+if (BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "crash-with-post-snapshot-helper" || BEHAVIOR === "crash-with-post-activation-regrouped-helper") {
   bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 }
 saveState(bootState);
@@ -306,6 +306,14 @@ rl.on("line", (line) => {
     switch (message.method) {
       case "initialize":
         state.capabilities = message.params.capabilities || null;
+        if (BEHAVIOR === "crash-with-post-activation-regrouped-helper") {
+          const helper = spawn(process.execPath, ["-e", SELF_EXPIRING_KEEPALIVE], {
+            detached: process.platform !== "win32",
+            stdio: "ignore"
+          });
+          helper.unref();
+          state.helperPids = [...(state.helperPids || []), helper.pid];
+        }
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         if (BEHAVIOR === "crash-with-regrouped-helper") {
@@ -323,6 +331,11 @@ rl.on("line", (line) => {
             saveState(current);
             setTimeout(() => process.exit(1), 100);
           }, 250);
+        }
+        if (BEHAVIOR === "crash-with-post-activation-regrouped-helper") {
+          // Leave enough time for the broker to persist the post-response
+          // ownership observation before simulating the later crash.
+          setTimeout(() => process.exit(1), 500);
         }
         break;
 

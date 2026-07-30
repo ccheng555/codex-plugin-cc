@@ -1,7 +1,36 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { captureStableSessionOwner, getLiveProcessPids, hasLiveProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  captureProcessOwnership,
+  captureStableSessionOwner,
+  getLiveProcessPids,
+  hasLiveProcessIdentity,
+  terminateProcessGroup,
+  terminateProcessTree
+} from "../plugins/codex/scripts/lib/process.mjs";
+
+test("captureProcessOwnership never treats a Darwin audit session as process containment", () => {
+  const snapshot = captureProcessOwnership(7300, {
+    platform: "darwin",
+    runCommandImpl(command, args) {
+      assert.equal(command, "/bin/ps");
+      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,sess=,stat=,lstart="]);
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "7300 1 7300 44001 S Mon Jul 27 00:09:00 2026\n",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.equal(snapshot.sessionId, null);
+  assert.equal(snapshot.members[0].sessionId, null);
+});
 
 test("captureStableSessionOwner records the hook process-group leader", () => {
   const owner = captureStableSessionOwner(7101, {
@@ -148,7 +177,7 @@ test("terminateProcessTree terminates Unix descendant groups deepest-first", asy
     expectedRootIdentity: "1234@Mon Jul 27 00:00:00 2026",
     runCommandImpl(command, args) {
       assert.equal(command, "/bin/ps");
-      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
+      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,sess=,stat=,lstart="]);
       const stdout = [...alive]
         .map((pid) => `${pid} ${parents.get(pid)} ${pid} S Mon Jul 27 00:00:0${pid - 1234} 2026`)
         .join("\n");
@@ -289,7 +318,7 @@ test("terminateProcessTree parses a captured Linux procps process table", async 
     expectedRootIdentity: "42001@Mon Jul 27 12:34:56 2026",
     runCommandImpl(command, args) {
       assert.equal(command, "/bin/ps");
-      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
+      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,sess=,stat=,lstart="]);
       const stdout = [...alive]
         .map((pid) => sample.split("\n").find((line) => line.startsWith(String(pid))))
         .filter(Boolean)
@@ -326,7 +355,7 @@ test("terminateProcessTree defers persisted cleanup when Unix process enumeratio
     },
     runCommandImpl(command, args) {
       assert.equal(command, "/bin/ps");
-      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
+      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,sess=,stat=,lstart="]);
       return {
         command,
         args,
@@ -1036,6 +1065,69 @@ test("terminateProcessGroup reclaims a post-snapshot member of the owned group",
   assert.deepEqual(signals, [[300, "SIGTERM"]]);
   assert.equal(outcome.verified, true);
   assert.equal(outcome.degraded, false);
+  assert.deepEqual(outcome.survivors, []);
+});
+
+test("terminateProcessGroup reclaims a post-activation group in the owned Unix session", async () => {
+  const signals = [];
+  const alive = new Set([100, 300]);
+  const ownershipSnapshot = {
+    rootPid: 100,
+    rootIdentity: "100@Mon Jul 27 00:00:00 2026",
+    processGroupId: 100,
+    sessionId: 100,
+    members: [
+      {
+        pid: 100,
+        parentPid: 1,
+        processGroupId: 100,
+        sessionId: 100,
+        state: "S",
+        startedAt: "Mon Jul 27 00:00:00 2026",
+        identity: "100@Mon Jul 27 00:00:00 2026",
+        depth: 0
+      }
+    ]
+  };
+  const outcome = await terminateProcessGroup(100, {
+    platform: "linux",
+    ownershipSnapshot,
+    pollIntervalMs: 0,
+    runCommandImpl(command, args) {
+      assert.equal(command, "/bin/ps");
+      assert.deepEqual(args, ["-axo", "pid=,ppid=,pgid=,sess=,stat=,lstart="]);
+      const rows = [];
+      if (alive.has(100)) {
+        rows.push("100 1 100 100 S Mon Jul 27 00:00:00 2026");
+      }
+      if (alive.has(300)) {
+        rows.push("300 1 300 100 S Mon Jul 27 00:00:02 2026");
+      }
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: rows.length > 0 ? `${rows.join("\n")}\n` : "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      signals.push([pid, signal]);
+      const groupId = Math.abs(pid);
+      for (const candidate of [...alive]) {
+        if (candidate === groupId) {
+          alive.delete(candidate);
+        }
+      }
+    }
+  });
+
+  assert.deepEqual(signals, [[-300, "SIGTERM"], [-100, "SIGTERM"]]);
+  assert.equal(outcome.verified, true);
+  assert.equal(outcome.degraded, false);
+  assert.equal(outcome.method, "process-session");
   assert.deepEqual(outcome.survivors, []);
 });
 

@@ -56,6 +56,7 @@ export interface CodexAppServerClientOptions {
   reuseExistingBroker?: boolean;
   gatedBrokerChild?: boolean;
   beforeAppServerActivation?: (ownershipSnapshot: unknown) => void | Promise<void>;
+  afterAppServerOwnershipRefresh?: (ownershipSnapshot: unknown) => void | Promise<void>;
 }
 
 export interface AppServerMethodMap {

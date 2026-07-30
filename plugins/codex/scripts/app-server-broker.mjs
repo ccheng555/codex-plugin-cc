@@ -8,7 +8,12 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_OWNERSHIP_RPC_CODE, BROKER_STREAM_COMPLETED_METHOD, CodexAppServerClient } from "./lib/app-server.mjs";
-import { loadBrokerRegistration, publishBrokerChild, releaseBrokerChild } from "./lib/broker-ownership.mjs";
+import {
+  loadBrokerRegistration,
+  publishBrokerChild,
+  publishBrokerChildObservation,
+  releaseBrokerChild
+} from "./lib/broker-ownership.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 import { getLiveProcessPids, getProcessIdentity } from "./lib/process.mjs";
 
@@ -336,6 +341,26 @@ async function main() {
             error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
             throw error;
           }
+        },
+        async afterAppServerOwnershipRefresh(ownershipSnapshot) {
+          if (registration?.registered !== true || childRegistration?.registered !== true) {
+            const error = new Error("Shared Codex app-server ownership registration was lost before helper observation.");
+            error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
+            throw error;
+          }
+          const observation = publishBrokerChildObservation(registration, {
+            child: childRegistration.child,
+            ownershipSnapshot
+          });
+          if (observation.observed !== true) {
+            const error = new Error(`Unable to publish shared Codex app-server helper ownership (${observation.reason ?? "unknown"}).`);
+            error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
+            throw error;
+          }
+          childRegistration = {
+            ...childRegistration,
+            child: observation.child
+          };
         }
       })
         .then(async (client) => {

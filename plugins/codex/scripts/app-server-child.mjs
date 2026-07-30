@@ -81,4 +81,7 @@ process.stdin.on("end", () => {
 process.stdin.on("error", () => {
   child?.stdin.destroy();
 });
-process.stdin.resume();
+// Keep protocol bytes buffered until activation has created the real app
+// server and its stdin pipe. Flowing stdin here can discard an initialize
+// request that races the activation-control pipe.
+process.stdin.pause();

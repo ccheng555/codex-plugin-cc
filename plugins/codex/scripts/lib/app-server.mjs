@@ -270,6 +270,59 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
+  mergeOwnershipSnapshot(observation) {
+    if (
+      !observation?.rootIdentity ||
+      observation.rootIdentity !== this.procIdentity ||
+      observation.rootPid !== this.ownershipSnapshot?.rootPid
+    ) {
+      throw new Error("Codex app-server ownership identity changed while refreshing its helper tree.");
+    }
+    const members = new Map();
+    for (const snapshot of [this.ownershipSnapshot, observation]) {
+      for (const member of snapshot?.members ?? []) {
+        members.set(member.identity, member);
+      }
+    }
+    this.ownershipSnapshot = {
+      ...observation,
+      members: [...members.values()]
+    };
+    return this.ownershipSnapshot;
+  }
+
+  async refreshOwnership() {
+    if (process.platform === "win32" || !this.procIdentity || !this.proc?.pid) {
+      return this.ownershipSnapshot ?? null;
+    }
+    const captureOwnership = this.options.captureProcessOwnershipImpl ?? captureProcessOwnership;
+    const observation = captureOwnership(this.proc.pid, {
+      cwd: this.cwd,
+      env: this.options.env ?? process.env
+    });
+    const ownershipSnapshot = this.mergeOwnershipSnapshot(observation);
+    await this.options.afterAppServerOwnershipRefresh?.(ownershipSnapshot);
+    return ownershipSnapshot;
+  }
+
+  async request(method, params) {
+    let result;
+    let requestError;
+    try {
+      result = await super.request(method, params);
+    } catch (error) {
+      requestError = error;
+    }
+    // Helpers may be created only after the gated wrapper is activated. Take
+    // and durably publish a fresh identity snapshot at every request boundary
+    // before the broker exposes the response or error to its caller.
+    await this.refreshOwnership();
+    if (requestError) {
+      throw requestError;
+    }
+    return result;
+  }
+
   startUnexpectedExitCleanup(pid) {
     if (
       this.unexpectedExitCleanupPromise ||

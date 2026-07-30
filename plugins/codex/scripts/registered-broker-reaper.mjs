@@ -11,7 +11,9 @@ import {
   assessBrokerOwners,
   loadBrokerChildren,
   loadBrokerRegistration,
+  loadBrokerTerminal,
   publishBrokerReaperReceipt,
+  publishBrokerTerminal,
   releaseBrokerChild,
   releaseBrokerRegistryLock,
   resolveBrokerOwnershipRoot
@@ -67,7 +69,15 @@ function listRegistrationCandidates(env) {
       ) {
         candidates.push({ valid: false, brokerKey: entry.name, registryDir, reason: "broker-record-invalid" });
       } else {
-        candidates.push({ valid: true, registration });
+        const terminal = loadBrokerTerminal(registration);
+        if (terminal.terminal === true) {
+          continue;
+        }
+        if (terminal.reason !== "terminal-absent") {
+          candidates.push({ valid: false, brokerKey: entry.name, registryDir, reason: terminal.reason });
+        } else {
+          candidates.push({ valid: true, registration });
+        }
       }
     } catch {
       candidates.push({ valid: false, brokerKey: entry.name, registryDir, reason: "broker-record-invalid" });
@@ -245,14 +255,30 @@ async function processRegistration(candidate, options) {
             residualIdentities,
             createdAt: (options.now ?? (() => new Date().toISOString()))()
           });
+          const terminal =
+            decision === "cleanup-verified" && receipt?.published === true
+              ? (options.publishBrokerTerminalImpl ?? publishBrokerTerminal)(lockedRegistration, {
+                  attemptId,
+                  receiptPath: receipt.path,
+                  retiredAt: (options.now ?? (() => new Date().toISOString()))(),
+                  registryLock
+                })
+              : null;
+          const terminalRecorded = decision !== "cleanup-verified" || terminal?.terminal === true;
           result = {
-            status: decision === "cleanup-verified" ? "reaped" : "report-only",
+            status: decision === "cleanup-verified" && receipt?.published === true && terminalRecorded ? "reaped" : "report-only",
             brokerKey: lockedRegistration.brokerKey,
             pid: lockedRegistration.broker.pid,
-            reason: receipt?.published === true ? decision : `${decision}-receipt-unavailable`,
+            reason:
+              receipt?.published !== true
+                ? `${decision}-receipt-unavailable`
+                : terminalRecorded
+                  ? decision
+                  : `${decision}-${terminal?.reason ?? "terminal-unavailable"}`,
             outcomes,
             residualIdentities,
-            receiptPath: receipt?.published === true ? receipt.path : null
+            receiptPath: receipt?.published === true ? receipt.path : null,
+            terminalPath: terminal?.terminal === true ? terminal.path : null
           };
         }
       }

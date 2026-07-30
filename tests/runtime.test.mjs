@@ -513,11 +513,11 @@ test("fake app-server crash reclaims an observed regrouped helper without replac
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
 });
 
-test("shared broker reclaims a post-snapshot helper before allowing replacement", async (t) => {
+test("shared broker durably observes and reclaims a post-activation regrouped helper", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
-  installFakeCodex(binDir, "crash-with-post-snapshot-helper");
+  installFakeCodex(binDir, "crash-with-post-activation-regrouped-helper");
   const env = withBrokerOwner({
     ...buildEnv(binDir),
     CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "1000"

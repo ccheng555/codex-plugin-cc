@@ -9,6 +9,7 @@ import {
   assessBrokerOwners,
   loadBrokerChildren,
   publishBrokerChild,
+  publishBrokerChildObservation,
   publishBrokerRegistration,
   publishRegisteredBroker,
   registerBrokerOwner,
@@ -453,4 +454,81 @@ test("broker child ownership is immutable and identity keyed", (t) => {
   const children = loadBrokerChildren(registration);
   assert.equal(children.children.length, 0);
   assert.equal(children.releasedChildren.length, 1);
+});
+
+test("post-activation child observations extend durable cleanup ownership", (t) => {
+  const { registration } = makeFixture(t);
+  const rootIdentity = "6200@Mon Jul 27 00:08:00 2026";
+  const child = publishBrokerChild(registration, {
+    ownershipSnapshot: {
+      rootPid: 6200,
+      rootIdentity,
+      processGroupId: 6200,
+      members: [
+        {
+          pid: 6200,
+          parentPid: 4100,
+          processGroupId: 6200,
+          state: "S",
+          startedAt: "Mon Jul 27 00:08:00 2026",
+          identity: rootIdentity,
+          depth: 0
+        }
+      ]
+    }
+  });
+  const helperIdentity = "6202@Mon Jul 27 00:08:02 2026";
+  const observed = publishBrokerChildObservation(registration, {
+    child: child.child,
+    ownershipSnapshot: {
+      rootPid: 6200,
+      rootIdentity,
+      processGroupId: 6200,
+      members: [
+        {
+          pid: 6200,
+          parentPid: 4100,
+          processGroupId: 6200,
+          state: "S",
+          startedAt: "Mon Jul 27 00:08:00 2026",
+          identity: rootIdentity,
+          depth: 0
+        },
+        {
+          pid: 6202,
+          parentPid: 6201,
+          processGroupId: 6202,
+          state: "S",
+          startedAt: "Mon Jul 27 00:08:02 2026",
+          identity: helperIdentity,
+          depth: 2
+        }
+      ]
+    },
+    now: () => "2026-07-27T00:08:03.000Z"
+  });
+
+  assert.equal(observed.observed, true);
+  assert.equal(fs.statSync(observed.path).mode & 0o777, 0o600);
+  const repeated = publishBrokerChildObservation(registration, {
+    child: child.child,
+    ownershipSnapshot: observed.observation.ownershipSnapshot,
+    now: () => "2026-07-27T00:08:04.000Z"
+  });
+  assert.equal(repeated.observed, true);
+  assert.equal(repeated.reason, "child-already-observed");
+  assert.equal(repeated.path, observed.path);
+  const loaded = loadBrokerChildren(registration);
+  assert.equal(loaded.valid, true);
+  assert.deepEqual(loaded.children[0].ownershipSnapshot.members.map((member) => member.identity), [
+    rootIdentity,
+    helperIdentity
+  ]);
+
+  const released = releaseBrokerChild(registration, {
+    child: loaded.children[0],
+    cleanupOutcome: { verified: true, survivors: [], survivorIdentities: [] }
+  });
+  assert.equal(released.released, true);
+  assert.equal(loadBrokerChildren(registration).releasedChildren[0].ownershipSnapshot.members.length, 2);
 });

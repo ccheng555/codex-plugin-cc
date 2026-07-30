@@ -138,6 +138,22 @@ test("registered cleanup reclaims children before the broker and writes a mode-0
   assert.ok(receiptPath);
   assert.equal(fs.statSync(receiptPath).mode & 0o777, 0o600);
   assert.equal(JSON.parse(fs.readFileSync(receiptPath, "utf8")).decision, "cleanup-verified");
+
+  const receiptNames = fs.readdirSync(path.dirname(receiptPath));
+  const repeated = await runRegisteredBrokerReaper({
+    mode: "apply-registered",
+    env,
+    getLiveProcessPidsImpl: () => [],
+    terminateProcessGroupImpl: async () => {
+      throw new Error("a terminal registry must not retry child cleanup");
+    },
+    terminateProcessTreeImpl: async () => {
+      throw new Error("a terminal registry must not retry broker cleanup");
+    },
+    attemptIdFactory: () => "attempt-should-not-run"
+  });
+  assert.equal(repeated.scanned, 0);
+  assert.deepEqual(fs.readdirSync(path.dirname(receiptPath)), receiptNames);
 });
 
 test("each verified child is released before a later target can block convergence", async (t) => {
