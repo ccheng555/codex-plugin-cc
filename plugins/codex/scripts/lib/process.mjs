@@ -430,11 +430,30 @@ function warnProcessCleanup(message, options) {
 
 function degradedDirectChildKill(pid, options, killImpl, reason) {
   const ownershipSnapshot = options.ownershipSnapshot ?? null;
+  const ownerHoldsLiveHandle = options.ownerHoldsLiveHandle === true;
   const canSignalOwnedGroup =
-    options.ownerHoldsLiveHandle === true &&
+    ownerHoldsLiveHandle &&
     ownershipSnapshot?.rootPid === pid &&
     ownershipSnapshot?.processGroupId === pid &&
     ownershipSnapshot?.rootIdentity === (options.expectedRootIdentity ?? ownershipSnapshot?.rootIdentity);
+  if (!ownerHoldsLiveHandle) {
+    warnProcessCleanup(
+      `Unable to verify Unix process cleanup for PID ${pid}; deferred signalling until process enumeration recovers (${String(reason).replace(/\s+/g, " ").trim()}). Surviving PIDs: ${pid}.`,
+      options
+    );
+    return normalizeProcessCleanupOutcome({
+      attempted: true,
+      delivered: false,
+      verified: false,
+      escalated: false,
+      degraded: true,
+      method: "deferred",
+      targets: [],
+      targetIdentities: options.expectedRootIdentity ? [options.expectedRootIdentity] : [],
+      survivors: [pid],
+      survivorIdentities: options.expectedRootIdentity ? [options.expectedRootIdentity] : []
+    });
+  }
   const directKillImpl = options.directKillImpl ?? ((signal) => killImpl(pid, signal));
   let delivered = false;
   try {

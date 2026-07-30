@@ -315,7 +315,7 @@ test("terminateProcessTree parses a captured Linux procps process table", async 
   assert.deepEqual(outcome.targets, [42002, 42001]);
 });
 
-test("terminateProcessTree falls back to a direct child kill when Unix process enumeration fails", async () => {
+test("terminateProcessTree defers persisted cleanup when Unix process enumeration fails", async () => {
   const signals = [];
   const warnings = [];
   const outcome = await terminateProcessTree(1234, {
@@ -342,12 +342,13 @@ test("terminateProcessTree falls back to a direct child kill when Unix process e
     }
   });
 
-  assert.deepEqual(signals, [[1234, "SIGKILL"]]);
+  assert.deepEqual(signals, []);
   assert.equal(outcome.verified, false);
   assert.equal(outcome.degraded, true);
-  assert.deepEqual(outcome.survivors, []);
+  assert.equal(outcome.method, "deferred");
+  assert.deepEqual(outcome.survivors, [1234]);
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /direct-child kill fallback.*none known/i);
+  assert.match(warnings[0], /deferred signalling.*1234/i);
 });
 
 test("terminateProcessTree preserves an owned detached group during degraded live-handle cleanup", async () => {

@@ -12,10 +12,10 @@ import { enqueueBackgroundTask, handleCancel, handleTaskWorker } from "../plugin
 import { cleanupSessionJobs, handleSessionEnd, handleSessionStart } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { isBrokerRequestAllowedDuringShutdown } from "../plugins/codex/scripts/app-server-broker.mjs";
-import { acquireBrokerRegistryLock, loadBrokerRegistration, registerBrokerOwner, releaseBrokerRegistryLock, SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
+import { acquireBrokerRegistryLock, loadBrokerChildren, loadBrokerRegistration, publishRegisteredBroker, registerBrokerOwner, releaseBrokerOwner, releaseBrokerRegistryLock, SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
 import { acquireBrokerLaunchLock, activateBrokerProcess, brokerLaunchLockPort, clearBrokerSession, ensureBrokerSession, loadBrokerSession, loadReusableBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
-import { captureProcessOwnership, getProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { captureProcessOwnership, getProcessIdentity, hasLiveProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { hasCancelFlag, listJobs, loadState, resolveStateDir, saveState, upsertJob, writeCancelFlag, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
@@ -90,12 +90,13 @@ test("broker rejects queued work after shutdown begins", () => {
   assert.equal(isBrokerRequestAllowedDuringShutdown(false, { id: 4, method: "thread/list" }), true);
 });
 
-test("SessionStart exports the stable process-group owner identity", () => {
+test("SessionStart exports the stable process-group owner identity and runs registered cleanup", async () => {
   const envFile = path.join(makeTempDir(), "session.env");
   const previousEnvFile = process.env.CLAUDE_ENV_FILE;
   process.env.CLAUDE_ENV_FILE = envFile;
   try {
-    handleSessionStart(
+    let reaperMode = null;
+    await handleSessionStart(
       {
         session_id: "session-owner-export",
         transcript_path: "/tmp/transcript.jsonl",
@@ -110,9 +111,14 @@ test("SessionStart exports the stable process-group owner identity", () => {
             identity: "7100@Mon Jul 27 00:07:00 2026",
             processGroupId: 7100
           };
+        },
+        async runRegisteredBrokerReaperImpl(options) {
+          reaperMode = options.mode;
+          return { mode: options.mode, scanned: 0, reaped: 0, reported: 0, results: [] };
         }
       }
     );
+    assert.equal(reaperMode, "apply-registered");
   } finally {
     if (previousEnvFile == null) {
       delete process.env.CLAUDE_ENV_FILE;
@@ -951,6 +957,54 @@ test("automatic broker rolls back when owner, state, or activation publication f
   }
 });
 
+test("automatic broker rollback remains locked until exact cleanup converges", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir
+  }, "locked-rollback");
+  let registration = null;
+  let brokerPid = null;
+  let releaseObserved = false;
+
+  await assert.rejects(
+    ensureBrokerSession(repo, {
+      env,
+      rollbackExitTimeoutMs: 0,
+      captureProcessOwnershipImpl(pid, options) {
+        brokerPid = pid;
+        return captureProcessOwnership(pid, options);
+      },
+      publishRegisteredBrokerImpl(options) {
+        registration = publishRegisteredBroker(options);
+        return registration;
+      },
+      saveBrokerSessionImpl() {
+        throw new Error("injected state publication failure");
+      },
+      releaseBrokerOwnerImpl(lockedRegistration, options) {
+        assert.equal(options.registryLock?.acquired, true);
+        assert.equal(fs.existsSync(options.registryLock.path), true);
+        assert.equal(acquireBrokerRegistryLock(lockedRegistration).acquired, false);
+        assert.equal(hasLiveProcessIdentity(brokerPid, registration.broker.pidIdentity), false);
+        releaseObserved = true;
+        return releaseBrokerOwner(lockedRegistration, options);
+      }
+    }),
+    (error) => error?.code === "BROKER_REGISTRATION_FAILED"
+  );
+
+  assert.equal(releaseObserved, true);
+  assert.equal(fs.existsSync(registration.registryLock.path), false);
+});
+
 test("a failed activation recovery marker is never reusable", async (t) => {
   if (process.platform === "win32") {
     t.skip("Unix process identities are required for the registered broker contract.");
@@ -1000,10 +1054,7 @@ test("a failed activation recovery marker is never reusable", async (t) => {
   assert.equal(loadReusableBrokerSession(repo, env), null);
   assert.doesNotThrow(() => process.kill(failedSession.pid, 0));
 
-  await assert.rejects(
-    ensureBrokerSession(repo, { env, killProcess: unverifiedCleanup }),
-    (error) => error?.code === "BROKER_CLEANUP_UNVERIFIED"
-  );
+  assert.equal(await ensureBrokerSession(repo, { env, killProcess: unverifiedCleanup }), null);
   assert.equal(loadBrokerSession(repo)?.pid, failedSession.pid);
   assert.equal(loadBrokerSession(repo)?.activationFailed, true);
 });
@@ -1253,6 +1304,43 @@ test("pre-activation broker exits when its launcher pipe closes", async (t) => {
   }, { timeoutMs: 2000 });
   assert.equal(fs.existsSync(socketPath), false);
   assert.equal(fs.existsSync(pidFile), false);
+});
+
+test("an unregistered broker refuses to activate a detached app-server child", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix broker sockets are required for this contract.");
+    return;
+  }
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const socketPath = path.join("/private/tmp", `cxc-unregistered-child-${process.pid}-${Date.now()}.sock`);
+  const endpoint = `unix:${socketPath}`;
+  installFakeCodex(binDir, "with-helper-child");
+  const env = buildEnv(binDir);
+  const broker = spawn(process.execPath, [BROKER_SCRIPT, "serve", "--endpoint", endpoint, "--cwd", repo], {
+    cwd: repo,
+    env,
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore"]
+  });
+  const brokerOwnership = captureProcessOwnership(broker.pid, { cwd: repo, env });
+  t.after(async () => {
+    await sendBrokerShutdown(endpoint).catch(() => {});
+    await terminateProcessTree(broker.pid, {
+      expectedRootIdentity: brokerOwnership.rootIdentity,
+      ownershipSnapshot: brokerOwnership
+    }).catch(() => {});
+  });
+  assert.equal(await waitForBrokerEndpoint(endpoint, 2000), true);
+
+  const client = await CodexAppServerClient.connect(repo, { brokerEndpoint: endpoint, env });
+  await assert.rejects(
+    client.request("thread/start", { cwd: repo, ephemeral: true }),
+    (error) => error?.rpcCode === -32005
+  );
+  await client.close();
+  assert.equal(fs.existsSync(fakeStatePath), false);
 });
 
 test("automatic broker creation stays disabled where registered ownership is unsupported", async () => {
@@ -2347,6 +2435,43 @@ test("task using the shared broker still completes when Codex spawns subagents",
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+});
+
+test("inferred shared turn completion releases broker stream state and its idle child", async (t) => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "with-subagent-no-main-turn-completed");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "100"
+  }, "inferred-completion");
+
+  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const brokerSession = loadBrokerSession(repo);
+  assert.equal(brokerSession?.registry?.registered, true);
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+  });
+
+  await waitFor(() => {
+    const children = loadBrokerChildren(brokerSession.registry);
+    return children.valid === true && children.children.length === 0 && children.releasedChildren.length === 1;
+  }, { timeoutMs: 2500, intervalMs: 25 });
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -4340,7 +4465,7 @@ test("shared broker releases its idle app-server child and restarts it on demand
   assert.equal(fakeState.helperPids.length, 2);
 });
 
-test("identity capture failure cleans the owned app-server tree and reports unverified cleanup", async (t) => {
+test("identity capture failure prevents app-server activation and reports unverified cleanup", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -4358,23 +4483,37 @@ test("identity capture failure cleans the owned app-server tree and reports unve
     (error) => error.cleanupOutcome?.verified === false && error.cleanupOutcome?.degraded === true
   );
 
-  const helperPid = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).helperPids[0];
-  function isRunning(pid) {
-    const result = run("/bin/ps", ["-o", "stat=", "-p", String(pid)]);
-    return result.status === 0 && !result.stdout.trim().startsWith("Z");
+  assert.equal(fs.existsSync(fakeStatePath), false);
+});
+
+test("a broker-owned app-server cannot activate before durable child publication", async () => {
+  if (process.platform === "win32") {
+    return;
   }
-  await waitFor(() => {
-    return !isRunning(helperPid);
-  });
-  const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(state.appServerStarts, 1);
-  t.after(() => {
-    try {
-      process.kill(helperPid, "SIGKILL");
-    } catch {
-      // Ignore the helper after cleanup.
-    }
-  });
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "with-helper-child");
+  const env = buildEnv(binDir);
+  let wrapperPid = null;
+
+  await assert.rejects(
+    CodexAppServerClient.connect(repo, {
+      disableBroker: true,
+      gatedBrokerChild: true,
+      env,
+      beforeAppServerActivation(ownershipSnapshot) {
+        wrapperPid = ownershipSnapshot.rootPid;
+        assert.equal(fs.existsSync(fakeStatePath), false);
+        throw new Error("injected durable child publication failure");
+      }
+    }),
+    /durable child publication failure/
+  );
+
+  assert.ok(Number.isFinite(wrapperPid));
+  assert.equal(fs.existsSync(fakeStatePath), false);
+  await waitFor(() => getProcessIdentity(wrapperPid) === null);
 });
 
 test("shared broker keeps active work alive after its client disconnects", async (t) => {

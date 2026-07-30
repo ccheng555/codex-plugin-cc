@@ -146,6 +146,30 @@ function validRegistryLock(registration, lock) {
   );
 }
 
+function createPreparedRegistryLock(registration, preparedRegistryDir, options = {}) {
+  const pid = options.pid ?? process.pid;
+  if (!isSafePid(pid)) {
+    return { acquired: false, reason: "registry-lock-owner-invalid" };
+  }
+  const token = randomUUID();
+  const preparedLockPath = path.join(preparedRegistryDir, REGISTRY_LOCK_DIR_NAME);
+  ensurePrivateDir(preparedLockPath);
+  createImmutableJson(path.join(preparedLockPath, "owner.json"), {
+    version: BROKER_OWNERSHIP_VERSION,
+    kind: "registry-lock",
+    brokerKey: registration.brokerKey,
+    token,
+    pid,
+    acquiredAt: (options.now ?? (() => new Date().toISOString()))()
+  });
+  return {
+    acquired: true,
+    brokerKey: registration.brokerKey,
+    token,
+    path: path.join(registration.registryDir, REGISTRY_LOCK_DIR_NAME)
+  };
+}
+
 export function acquireBrokerRegistryLock(
   registration,
   {
@@ -390,7 +414,8 @@ export function publishRegisteredBroker({
   ownershipSnapshot,
   env = process.env,
   now = () => new Date().toISOString(),
-  hasLiveProcessIdentityImpl = hasLiveProcessIdentity
+  hasLiveProcessIdentityImpl = hasLiveProcessIdentity,
+  retainRegistryLock = false
 }) {
   const registryRoot = resolveBrokerOwnershipRoot(env);
   if (!registryRoot) {
@@ -445,9 +470,30 @@ export function publishRegisteredBroker({
   try {
     createImmutableJson(path.join(preparedDir, "broker.json"), broker);
     createImmutableJson(path.join(preparedDir, "owners", `${owner.ownerKey}.json`), ownerRecord);
+    const registryLock = retainRegistryLock
+      ? createPreparedRegistryLock(registration, preparedDir, { now })
+      : null;
+    if (retainRegistryLock && registryLock?.acquired !== true) {
+      return { registered: false, reason: registryLock?.reason ?? "registry-lock-unavailable" };
+    }
+    // Publication is the point at which the reaper can first observe this
+    // broker. Revalidate both identities after all prepared bytes exist and
+    // immediately before the atomic rename so the visible initial state never
+    // begins with a dead sole owner or a reused broker PID.
+    if (!hasLiveProcessIdentityImpl(owner.pid, owner.identity)) {
+      return { registered: false, reason: "session-owner-not-live" };
+    }
+    if (!hasLiveProcessIdentityImpl(pid, ownershipSnapshot.rootIdentity)) {
+      return { registered: false, reason: "broker-not-live" };
+    }
     fs.renameSync(preparedDir, registration.registryDir);
     requirePrivateDirectory(registration.registryDir);
-    return { ...registration, broker, ownerKey: owner.ownerKey };
+    return {
+      ...registration,
+      broker,
+      ownerKey: owner.ownerKey,
+      ...(registryLock ? { registryLock } : {})
+    };
   } finally {
     if (fs.existsSync(preparedDir)) {
       fs.rmSync(preparedDir, { recursive: true, force: true });

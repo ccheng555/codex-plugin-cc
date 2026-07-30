@@ -26,6 +26,7 @@ import {
 import { loadState, resolveStateFile, saveState, writeCancelFlag, writeJobFile } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { runRegisteredBrokerReaper } from "./registered-broker-reaper.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
@@ -136,7 +137,7 @@ export async function cleanupSessionJobs(cwd, sessionId, dependencies = {}) {
   return { verified: retainedJobs.length === 0, failures: [] };
 }
 
-export function handleSessionStart(input, dependencies = {}) {
+export async function handleSessionStart(input, dependencies = {}) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
@@ -156,6 +157,19 @@ export function handleSessionStart(input, dependencies = {}) {
     }
   } catch {
     // Missing owner identity leaves this session in the report-only class.
+  }
+  // A killed session cannot run SessionEnd. Reap only immutable registered
+  // ownership on the next harness start so crash residue converges without a
+  // process-name sweep, cron job, or manual cleanup.
+  try {
+    const reapRegistered = dependencies.runRegisteredBrokerReaperImpl ?? runRegisteredBrokerReaper;
+    await reapRegistered({
+      mode: "apply-registered",
+      env: dependencies.env ?? process.env
+    });
+  } catch (error) {
+    const warn = dependencies.warnImpl ?? ((message) => process.stderr.write(`${message}\n`));
+    warn(`Registered Codex broker cleanup remains report-only: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -291,7 +305,7 @@ async function main() {
   const eventName = process.argv[2] ?? input.hook_event_name ?? "";
 
   if (eventName === "SessionStart") {
-    handleSessionStart(input);
+    await handleSessionStart(input);
     return;
   }
 

@@ -642,6 +642,7 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
 
   let fallbackToDirect = false;
   let ownerRegistered = false;
+  let transactionRegistryLock = null;
   try {
     const publishRegistration = options.publishRegisteredBrokerImpl ?? publishRegisteredBroker;
     const candidate = publishRegistration({
@@ -649,18 +650,25 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
       endpoint,
       pid: child.pid ?? null,
       ownershipSnapshot,
-      env
+      env,
+      retainRegistryLock: true
     });
     if (candidate.registered !== true) {
       fallbackToDirect = [
         "broker-identity-unavailable",
+        "broker-not-live",
         "plugin-data-unavailable",
         "session-owner-not-live",
         "session-owner-unavailable"
       ].includes(candidate.reason);
       throw new Error(`Broker registration is unavailable (${candidate.reason ?? "unknown"}).`);
     }
-    session.registry = candidate;
+    if (candidate.registryLock?.acquired !== true) {
+      throw new Error("Broker registration did not retain the launch transaction lock.");
+    }
+    transactionRegistryLock = candidate.registryLock;
+    const { registryLock: _registryLock, ...registration } = candidate;
+    session.registry = registration;
     ownerRegistered = true;
     const saveSession = options.saveBrokerSessionImpl ?? saveBrokerSession;
     session.activationPending = true;
@@ -672,10 +680,17 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
     saveSession(cwd, session);
     return session;
   } catch (error) {
-    if (ownerRegistered) {
+    // Keep the initial owner and the publication-time registry lock intact
+    // until exact rollback has converged. Otherwise a reaper can classify the
+    // half-launched broker as abandoned and race the launcher's own teardown.
+    const cleanup = await rollbackNewBrokerSession(cwd, child, session, options);
+    if (ownerRegistered && cleanup?.verified === true) {
       const releaseOwner = options.releaseBrokerOwnerImpl ?? releaseBrokerOwner;
       try {
-        const released = releaseOwner(session.registry, { env });
+        const released = releaseOwner(session.registry, {
+          env,
+          ...(transactionRegistryLock ? { registryLock: transactionRegistryLock } : {})
+        });
         if (released.released !== true) {
           process.stderr.write(`Warning: unable to release rolled-back Codex broker owner (${released.reason ?? "unknown"}).\n`);
         }
@@ -683,7 +698,6 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
         process.stderr.write(`Warning: unable to release rolled-back Codex broker owner: ${releaseError.message}.\n`);
       }
     }
-    const cleanup = await rollbackNewBrokerSession(cwd, child, session, options);
     if (cleanup?.verified !== true) {
       const cleanupError = new Error(`Broker launch failed and exact rollback is unverified: ${error.message}`);
       cleanupError.code = "BROKER_CLEANUP_UNVERIFIED";
@@ -697,6 +711,16 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
     transactionError.code = "BROKER_REGISTRATION_FAILED";
     transactionError.cause = error;
     throw transactionError;
+  } finally {
+    if (transactionRegistryLock && session.registry) {
+      const releaseRegistryLock = options.releaseBrokerRegistryLockImpl ?? releaseBrokerRegistryLock;
+      const released = releaseRegistryLock(session.registry, transactionRegistryLock);
+      if (released?.released !== true) {
+        const lockError = new Error(`Broker launch transaction lock release failed (${released?.reason ?? "unknown"}).`);
+        lockError.code = "BROKER_CLEANUP_UNVERIFIED";
+        throw lockError;
+      }
+    }
   }
 }
 

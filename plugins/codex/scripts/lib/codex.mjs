@@ -20,6 +20,7 @@
  *   rejectCompletion: (error: unknown) => void,
  *   finalTurn: Turn | null,
  *   completed: boolean,
+ *   inferredCompletion: boolean,
  *   finalAnswerSeen: boolean,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
@@ -40,7 +41,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, BROKER_OWNERSHIP_RPC_CODE, BROKER_STREAM_COMPLETED_METHOD, CodexAppServerClient } from "./app-server.mjs";
 import { loadReusableBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
@@ -321,6 +322,7 @@ function createTurnCaptureState(threadId, options = {}) {
     rejectCompletion,
     finalTurn: null,
     completed: false,
+    inferredCompletion: false,
     finalAnswerSeen: false,
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
@@ -364,6 +366,7 @@ function completeTurn(state, turn = null, options = {}) {
   }
 
   if (options.inferred) {
+    state.inferredCompletion = true;
     emitProgress(state.onProgress, "Turn completion inferred after the main thread finished and subagent work drained.", "finalizing");
   }
 
@@ -603,7 +606,14 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    const completedState = await state.completion;
+    if (completedState.inferredCompletion && client.transport === "broker") {
+      client.notify(BROKER_STREAM_COMPLETED_METHOD, {
+        threadId: completedState.threadId,
+        turnId: completedState.turnId
+      });
+    }
+    return completedState;
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -621,6 +631,7 @@ async function withAppServer(cwd, fn) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
     const shouldRetryDirect =
       (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
+      (client?.transport === "broker" && error?.rpcCode === BROKER_OWNERSHIP_RPC_CODE) ||
       (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
 
     if (client) {

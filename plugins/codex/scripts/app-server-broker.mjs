@@ -7,7 +7,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, BROKER_OWNERSHIP_RPC_CODE, BROKER_STREAM_COMPLETED_METHOD, CodexAppServerClient } from "./lib/app-server.mjs";
 import { loadBrokerRegistration, publishBrokerChild, releaseBrokerChild } from "./lib/broker-ownership.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 import { getLiveProcessPids, getProcessIdentity } from "./lib/process.mjs";
@@ -122,21 +122,20 @@ async function main() {
   const sockets = new Set();
 
   function getBrokerRegistration() {
-    if (brokerRegistration?.registered === true) {
-      return brokerRegistration;
-    }
     try {
       const brokerIdentity = getProcessIdentity(process.pid);
       if (brokerIdentity) {
         const candidate = loadBrokerRegistration({ endpoint, brokerIdentity });
         if (candidate.registered === true) {
           brokerRegistration = candidate;
+          return brokerRegistration;
         }
       }
     } catch {
       // Missing registry evidence keeps the child outside automated cleanup.
     }
-    return brokerRegistration;
+    brokerRegistration = null;
+    return null;
   }
 
   function cancelChildIdleClose() {
@@ -319,32 +318,37 @@ async function main() {
       ensureCleanupSafeToSpawn();
     }
     if (!appClientStartPromise) {
-      appClientStartPromise = CodexAppServerClient.connect(cwd, { disableBroker: true })
+      let childRegistration = null;
+      let registration = null;
+      appClientStartPromise = CodexAppServerClient.connect(cwd, {
+        disableBroker: true,
+        gatedBrokerChild: true,
+        async beforeAppServerActivation(ownershipSnapshot) {
+          registration = getBrokerRegistration();
+          if (registration?.registered !== true) {
+            const error = new Error("Shared Codex broker ownership registration is unavailable.");
+            error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
+            throw error;
+          }
+          childRegistration = publishBrokerChild(registration, { ownershipSnapshot });
+          if (childRegistration.registered !== true) {
+            const error = new Error(`Unable to register shared Codex app-server ownership (${childRegistration.reason ?? "unknown"}).`);
+            error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
+            throw error;
+          }
+        }
+      })
         .then(async (client) => {
-          const registration = getBrokerRegistration();
-          let childRegistration = null;
-          if (registration?.registered === true) {
-            try {
-              childRegistration = client.ownershipSnapshot
-                ? publishBrokerChild(registration, { ownershipSnapshot: client.ownershipSnapshot })
-                : { registered: false, reason: "child-identity-unavailable" };
-            } catch (error) {
-              await client.close().catch(() => {});
-              throw error;
-            }
-            if (childRegistration.registered !== true) {
-              await client.close().catch(() => {});
-              const error = new Error(`Unable to register shared Codex app-server ownership (${childRegistration.reason ?? "unknown"}).`);
-              error.rpcCode = BROKER_SHUTDOWN_RPC_CODE;
-              throw error;
-            }
+          if (registration?.registered !== true || childRegistration?.registered !== true) {
+            await client.close().catch(() => {});
+            const error = new Error("Shared Codex app-server activation lost its durable ownership registration.");
+            error.rpcCode = BROKER_OWNERSHIP_RPC_CODE;
+            throw error;
           }
           let registryChild = null;
           appClient = client;
-          if (registration?.registered === true) {
-            registryChild = childRegistration.child;
-            appClientRegistryChild = registryChild;
-          }
+          registryChild = childRegistration.child;
+          appClientRegistryChild = registryChild;
           client.setNotificationHandler(routeNotification);
           const childPid = client.proc?.pid ?? null;
           client.setExitHandler(() => {
@@ -517,6 +521,19 @@ async function main() {
         }
 
         if (message.method === "initialized" && message.id === undefined) {
+          continue;
+        }
+
+        if (message.method === BROKER_STREAM_COMPLETED_METHOD && message.id === undefined) {
+          const threadId = message.params?.threadId ?? null;
+          if (
+            activeStreamRunning &&
+            activeStreamSocket === socket &&
+            (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId))
+          ) {
+            clearStreamState();
+            scheduleChildIdleClose();
+          }
           continue;
         }
 

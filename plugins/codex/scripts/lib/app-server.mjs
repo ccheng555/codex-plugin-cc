@@ -12,6 +12,7 @@ import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadReusableBrokerSession } from "./broker-lifecycle.mjs";
 import { captureProcessOwnership, normalizeProcessCleanupOutcome, terminateProcessGroup, terminateProcessTree } from "./process.mjs";
@@ -19,9 +20,12 @@ import { captureProcessOwnership, normalizeProcessCleanupOutcome, terminateProce
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 const DEFAULT_CLOSE_WAIT_MS = 2000;
+const GATED_APP_SERVER_CHILD = fileURLToPath(new URL("../app-server-child.mjs", import.meta.url));
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+export const BROKER_OWNERSHIP_RPC_CODE = -32005;
+export const BROKER_STREAM_COMPLETED_METHOD = "broker/stream-completed";
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -194,11 +198,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    const gated = this.options.gatedBrokerChild === true && process.platform !== "win32";
+    this.proc = spawn(gated ? process.execPath : "codex", gated ? [GATED_APP_SERVER_CHILD] : ["app-server"], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: gated ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
     });
@@ -232,10 +237,6 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleLine(line);
     });
 
-    await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
-      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
     try {
       const captureOwnership = this.options.captureProcessOwnershipImpl ?? captureProcessOwnership;
       this.ownershipSnapshot =
@@ -254,6 +255,18 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.identityCaptureFailed = true;
       throw new Error("Unable to capture codex app-server process identity.");
     }
+    if (gated) {
+      await this.options.beforeAppServerActivation?.(this.ownershipSnapshot);
+      const activationControl = this.proc.stdio?.[3];
+      if (!activationControl) {
+        throw new Error("Codex app-server activation control is unavailable.");
+      }
+      activationControl.end("activate\n");
+    }
+    await this.request("initialize", {
+      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
+      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
+    });
     this.notify("initialized", {});
   }
 
@@ -315,6 +328,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
 
     if (this.proc) {
+      this.proc.stdio?.[3]?.end?.();
       try {
         this.proc.stdin.end();
       } catch {
