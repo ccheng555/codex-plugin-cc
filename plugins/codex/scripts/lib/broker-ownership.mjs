@@ -671,6 +671,39 @@ function validSnapshotMember(record) {
   );
 }
 
+function validOwnershipTree(snapshot, rootPid, rootIdentity) {
+  if (!Array.isArray(snapshot?.members) || snapshot.members.length === 0) {
+    return false;
+  }
+  const membersByPid = new Map();
+  const memberIdentities = new Set();
+  for (const member of snapshot.members) {
+    if (
+      !validSnapshotMember(member) ||
+      membersByPid.has(member.pid) ||
+      memberIdentities.has(member.identity)
+    ) {
+      return false;
+    }
+    membersByPid.set(member.pid, member);
+    memberIdentities.add(member.identity);
+  }
+  const root = membersByPid.get(rootPid);
+  if (root?.identity !== rootIdentity || root.depth !== 0) {
+    return false;
+  }
+  for (const member of snapshot.members) {
+    if (member.pid === rootPid) {
+      continue;
+    }
+    const parent = membersByPid.get(member.parentPid);
+    if (!parent || member.depth !== parent.depth + 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function validChildRecord(record, filePath, registration) {
   const snapshot = record?.ownershipSnapshot;
   return Boolean(
@@ -688,15 +721,8 @@ function validChildRecord(record, filePath, registration) {
       (snapshot.sessionId == null ||
         (isSafePid(snapshot.sessionId) &&
           snapshot.sessionId === snapshot.rootPid)) &&
-      Array.isArray(snapshot.members) &&
-      snapshot.members.length > 0 &&
-      snapshot.members.every(validSnapshotMember) &&
-      snapshot.members.some(
-        (member) =>
-          member.pid === record.pid &&
-          member.identity === record.pidIdentity &&
-          (snapshot.sessionId == null || member.sessionId === snapshot.sessionId)
-      )
+      validOwnershipTree(snapshot, record.pid, record.pidIdentity) &&
+      (snapshot.sessionId == null || snapshot.members.find((member) => member.pid === record.pid)?.sessionId === snapshot.sessionId)
   );
 }
 
@@ -716,15 +742,8 @@ function validChildObservation(record, filePath, registration, child) {
       snapshot.processGroupId === child.processGroupId &&
       (snapshot.sessionId == null ||
         (isSafePid(snapshot.sessionId) && snapshot.sessionId === snapshot.rootPid)) &&
-      Array.isArray(snapshot.members) &&
-      snapshot.members.length > 0 &&
-      snapshot.members.every(validSnapshotMember) &&
-      snapshot.members.some(
-        (member) =>
-          member.pid === child.pid &&
-          member.identity === child.pidIdentity &&
-          (snapshot.sessionId == null || member.sessionId === snapshot.sessionId)
-      ) &&
+      validOwnershipTree(snapshot, child.pid, child.pidIdentity) &&
+      (snapshot.sessionId == null || snapshot.members.find((member) => member.pid === child.pid)?.sessionId === snapshot.sessionId) &&
       typeof record.observedAt === "string" &&
       record.observedAt.length > 0
   );
@@ -1086,7 +1105,7 @@ export function publishBrokerChild(registration, options = {}) {
     !isSafePid(ownershipSnapshot?.processGroupId) ||
     (ownershipSnapshot?.sessionId != null &&
       (!isSafePid(ownershipSnapshot.sessionId) || ownershipSnapshot.sessionId !== pid)) ||
-    !Array.isArray(ownershipSnapshot?.members)
+    !validOwnershipTree(ownershipSnapshot, pid, identity)
   ) {
     return { registered: false, reason: "child-identity-unavailable" };
   }

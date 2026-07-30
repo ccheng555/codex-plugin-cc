@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -478,6 +479,7 @@ test("post-activation child observations extend durable cleanup ownership", (t) 
     }
   });
   const helperIdentity = "6202@Mon Jul 27 00:08:02 2026";
+  const helperParentIdentity = "6201@Mon Jul 27 00:08:01 2026";
   const observed = publishBrokerChildObservation(registration, {
     child: child.child,
     ownershipSnapshot: {
@@ -493,6 +495,15 @@ test("post-activation child observations extend durable cleanup ownership", (t) 
           startedAt: "Mon Jul 27 00:08:00 2026",
           identity: rootIdentity,
           depth: 0
+        },
+        {
+          pid: 6201,
+          parentPid: 6200,
+          processGroupId: 6200,
+          state: "S",
+          startedAt: "Mon Jul 27 00:08:01 2026",
+          identity: helperParentIdentity,
+          depth: 1
         },
         {
           pid: 6202,
@@ -522,6 +533,7 @@ test("post-activation child observations extend durable cleanup ownership", (t) 
   assert.equal(loaded.valid, true);
   assert.deepEqual(loaded.children[0].ownershipSnapshot.members.map((member) => member.identity), [
     rootIdentity,
+    helperParentIdentity,
     helperIdentity
   ]);
 
@@ -530,5 +542,76 @@ test("post-activation child observations extend durable cleanup ownership", (t) 
     cleanupOutcome: { verified: true, survivors: [], survivorIdentities: [] }
   });
   assert.equal(released.released, true);
-  assert.equal(loadBrokerChildren(registration).releasedChildren[0].ownershipSnapshot.members.length, 2);
+  assert.equal(loadBrokerChildren(registration).releasedChildren[0].ownershipSnapshot.members.length, 3);
+});
+
+test("an observation member outside the immutable child tree makes the registry report-only", (t) => {
+  const { registration } = makeFixture(t);
+  const rootIdentity = "6300@Mon Jul 27 00:09:00 2026";
+  const child = publishBrokerChild(registration, {
+    ownershipSnapshot: {
+      rootPid: 6300,
+      rootIdentity,
+      processGroupId: 6300,
+      members: [
+        {
+          pid: 6300,
+          parentPid: 4100,
+          processGroupId: 6300,
+          state: "S",
+          startedAt: "Mon Jul 27 00:09:00 2026",
+          identity: rootIdentity,
+          depth: 0
+        }
+      ]
+    }
+  });
+  const ownershipSnapshot = {
+    rootPid: 6300,
+    rootIdentity,
+    processGroupId: 6300,
+    members: [
+      child.child.ownershipSnapshot.members[0],
+      {
+        pid: 9900,
+        parentPid: 1,
+        processGroupId: 9900,
+        state: "S",
+        startedAt: "Mon Jul 27 00:09:01 2026",
+        identity: "9900@Mon Jul 27 00:09:01 2026",
+        depth: 1
+      }
+    ]
+  };
+
+  const refused = publishBrokerChildObservation(registration, {
+    child: child.child,
+    ownershipSnapshot
+  });
+  assert.equal(refused.observed, false);
+  assert.equal(refused.reason, "child-observation-invalid");
+
+  const observationKey = createHash("sha256").update(JSON.stringify(ownershipSnapshot)).digest("hex");
+  const observationDir = path.join(registration.registryDir, "child-observations", child.child.childKey);
+  const observationPath = path.join(observationDir, `${observationKey}.json`);
+  fs.mkdirSync(observationDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    observationPath,
+    `${JSON.stringify({
+      version: 1,
+      kind: "child-observation",
+      brokerKey: registration.brokerKey,
+      childKey: child.child.childKey,
+      observationKey,
+      ownershipSnapshot,
+      observedAt: "2026-07-27T00:09:02.000Z"
+    })}\n`,
+    { mode: 0o600 }
+  );
+
+  const loaded = loadBrokerChildren(registration);
+  assert.equal(loaded.valid, false);
+  assert.equal(loaded.reason, "malformed-child-registry");
+  assert.deepEqual(loaded.children, []);
+  assert.deepEqual(loaded.malformed, [observationPath]);
 });
