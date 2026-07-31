@@ -19,6 +19,7 @@ import { getLiveProcessPids, getProcessIdentity } from "./lib/process.mjs";
 
 const DEFAULT_CHILD_IDLE_MS = 5 * 60 * 1000;
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const TEST_BROKER_TTL_ENV = "CODEX_COMPANION_TEST_BROKER_TTL_MS";
 const BROKER_CLEANUP_UNVERIFIED_RPC_CODE = -32002;
 const BROKER_SHUTDOWN_RPC_CODE = -32003;
 const BROKER_NOT_ACTIVATED_RPC_CODE = -32004;
@@ -97,6 +98,18 @@ function writePidFile(pidFile) {
   fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
 }
 
+function resolveTestBrokerTtlMs() {
+  const raw = process.env[TEST_BROKER_TTL_ENV];
+  if (raw == null || raw === "") {
+    return null;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 100 || value > 10 * 60 * 1000) {
+    throw new Error(`${TEST_BROKER_TTL_ENV} must be an integer from 100 to 600000 milliseconds.`);
+  }
+  return value;
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
@@ -117,6 +130,7 @@ async function main() {
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
   const activationRequired = options["require-activation-stdin"] === true;
+  const testBrokerTtlMs = resolveTestBrokerTtlMs();
   writePidFile(pidFile);
 
   const childIdleMs = resolveChildIdleMs();
@@ -141,6 +155,7 @@ async function main() {
   let streamTurnCounter = 0;
   let blockedCleanup = null;
   let brokerRegistration = null;
+  let testBrokerTtlTimer = null;
   const sockets = new Set();
 
   function getBrokerRegistration() {
@@ -458,6 +473,10 @@ async function main() {
       server.close(resolve);
     });
     shutdownPromise = (async () => {
+      if (testBrokerTtlTimer) {
+        clearTimeout(testBrokerTtlTimer);
+        testBrokerTtlTimer = null;
+      }
       cancelChildIdleClose();
       for (const socket of sockets) {
         socket.destroy();
@@ -721,6 +740,18 @@ async function main() {
   server.listen(listenTarget.path, () => {
     if (activationRequired) {
       setupActivationGate(server);
+    }
+    if (testBrokerTtlMs != null) {
+      // Test suites intentionally exercise real detached broker behavior. A
+      // bounded test-only lifetime prevents an interrupted runner from leaving
+      // its fixture broker behind after normal teardown becomes impossible.
+      testBrokerTtlTimer = setTimeout(() => {
+        testBrokerTtlTimer = null;
+        void shutdown(server)
+          .catch(() => {})
+          .finally(() => process.exit(0));
+      }, testBrokerTtlMs);
+      testBrokerTtlTimer.unref?.();
     }
   });
 }

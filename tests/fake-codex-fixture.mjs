@@ -726,6 +726,7 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
+    CODEX_COMPANION_TEST_BROKER_TTL_MS: "30000",
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }

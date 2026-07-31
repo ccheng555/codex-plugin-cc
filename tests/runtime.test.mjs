@@ -1527,6 +1527,38 @@ test("an unreachable registered broker is never terminated while an owner is liv
   assert.equal(loadBrokerSession(repo)?.pid, first.pid);
 });
 
+test("a detached test broker self-expires when its test runner cannot clean it", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix broker sockets are required for this contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const socketPath = path.join("/private/tmp", `cxc-test-ttl-${process.pid}-${Date.now()}.sock`);
+  const endpoint = `unix:${socketPath}`;
+  const broker = spawn(process.execPath, [BROKER_SCRIPT, "serve", "--endpoint", endpoint, "--cwd", repo], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_TEST_BROKER_TTL_MS: "250"
+    },
+    detached: true,
+    stdio: "ignore"
+  });
+  broker.unref();
+  const ownership = captureProcessOwnership(broker.pid, { cwd: repo });
+  t.after(async () => {
+    await terminateProcessTree(broker.pid, {
+      expectedRootIdentity: ownership.rootIdentity,
+      ownershipSnapshot: ownership
+    }).catch(() => {});
+  });
+
+  assert.equal(await waitForBrokerEndpoint(endpoint, 2000), true);
+  await waitFor(() => !hasLiveProcessIdentity(broker.pid, ownership.rootIdentity), { timeoutMs: 2000 });
+  assert.equal(fs.existsSync(socketPath), false);
+});
+
 test("pre-activation broker exits when its launcher pipe closes", async (t) => {
   if (process.platform === "win32") {
     t.skip("Unix process groups are required for this contract.");
@@ -1541,7 +1573,14 @@ test("pre-activation broker exits when its launcher pipe closes", async (t) => {
   const child = spawn(
     process.execPath,
     [BROKER_SCRIPT, "serve", "--endpoint", endpoint, "--cwd", repo, "--pid-file", pidFile, "--require-activation-stdin"],
-    { cwd: repo, detached: true, stdio: ["pipe", "ignore", "ignore"] }
+    {
+      cwd: repo,
+      env: { ...process.env, CODEX_COMPANION_TEST_BROKER_TTL_MS: "30000" },
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+      timeout: 30000,
+      killSignal: "SIGKILL"
+    }
   );
   const ownershipSnapshot = captureProcessOwnership(child.pid, { cwd: repo });
   t.after(async () => {
@@ -1595,8 +1634,10 @@ test("an unregistered broker refuses to activate a detached app-server child", a
   const broker = spawn(process.execPath, [BROKER_SCRIPT, "serve", "--endpoint", endpoint, "--cwd", repo], {
     cwd: repo,
     env,
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore"]
+    detached: false,
+    stdio: ["ignore", "ignore", "ignore"],
+    timeout: 30000,
+    killSignal: "SIGKILL"
   });
   const brokerOwnership = captureProcessOwnership(broker.pid, { cwd: repo, env });
   t.after(async () => {
@@ -1605,6 +1646,7 @@ test("an unregistered broker refuses to activate a detached app-server child", a
       expectedRootIdentity: brokerOwnership.rootIdentity,
       ownershipSnapshot: brokerOwnership
     }).catch(() => {});
+    await waitFor(() => !hasLiveProcessIdentity(broker.pid, brokerOwnership.rootIdentity));
   });
   assert.equal(await waitForBrokerEndpoint(endpoint, 2000), true);
 
