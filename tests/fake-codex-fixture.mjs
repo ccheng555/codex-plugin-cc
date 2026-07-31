@@ -288,7 +288,7 @@ if (BEHAVIOR === "with-helper-child" || BEHAVIOR === "slow-task-with-helper-chil
     bootState.helperPids = [...(bootState.helperPids || []), helper.pid];
   }
 }
-if (BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "crash-with-post-snapshot-helper" || BEHAVIOR === "crash-with-post-activation-regrouped-helper" || BEHAVIOR === "post-activation-helper-on-thread-list") {
+if (BEHAVIOR === "crash-with-regrouped-helper" || BEHAVIOR === "crash-with-post-snapshot-helper" || BEHAVIOR === "crash-with-post-activation-regrouped-helper" || BEHAVIOR === "post-activation-helper-on-thread-list" || BEHAVIOR === "streaming-helper-after-response") {
   bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 }
 saveState(bootState);
@@ -510,6 +510,22 @@ rl.on("line", (line) => {
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (BEHAVIOR === "streaming-helper-after-response") {
+          setTimeout(() => {
+            const helper = spawn(process.execPath, ["-e", SELF_EXPIRING_KEEPALIVE], {
+              detached: process.platform !== "win32",
+              stdio: "ignore"
+            });
+            helper.unref();
+            const current = loadState();
+            current.helperPids = [...(current.helperPids || []), helper.pid];
+            saveState(current);
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "late-helper" } } });
+            setTimeout(() => process.exit(1), 750);
+          }, 100);
+          break;
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)

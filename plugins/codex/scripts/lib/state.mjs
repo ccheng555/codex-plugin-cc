@@ -107,7 +107,7 @@ export function saveState(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(cwd, job.id);
+    removeJobFile(cwd, job.id, { preserveCancelFlag: hasCancelFlag(cwd, job.id) });
     removeFileIfExists(job.logFile);
   }
 
@@ -194,9 +194,11 @@ export function removeCancelFlag(cwd, jobId) {
   removeFileIfExists(resolveCancelFlag(cwd, jobId));
 }
 
-function removeJobFile(cwd, jobId) {
+function removeJobFile(cwd, jobId, options = {}) {
   removeFileIfExists(resolveJobFile(cwd, jobId));
-  removeCancelFlag(cwd, jobId);
+  if (options.preserveCancelFlag !== true) {
+    removeCancelFlag(cwd, jobId);
+  }
 }
 
 export function resolveJobLogFile(cwd, jobId) {

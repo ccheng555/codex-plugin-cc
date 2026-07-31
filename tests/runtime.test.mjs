@@ -12,11 +12,11 @@ import { enqueueBackgroundTask, handleCancel, handleTaskWorker } from "../plugin
 import { cleanupSessionJobs, handleSessionEnd, handleSessionStart } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { isBrokerRequestAllowedDuringShutdown } from "../plugins/codex/scripts/app-server-broker.mjs";
-import { acquireBrokerRegistryLock, loadBrokerChildren, loadBrokerRegistration, publishRegisteredBroker, registerBrokerOwner, releaseBrokerOwner, releaseBrokerRegistryLock, SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
+import { acquireBrokerRegistryLock, loadBrokerChildren, loadBrokerRegistration, publishBrokerChild, publishRegisteredBroker, registerBrokerOwner, releaseBrokerOwner, releaseBrokerRegistryLock, SESSION_OWNER_IDENTITY_ENV, SESSION_OWNER_PID_ENV } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
 import { acquireBrokerLaunchLock, activateBrokerProcess, brokerLaunchLockPort, clearBrokerSession, ensureBrokerSession, loadBrokerSession, loadReusableBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
 import { captureProcessOwnership, getProcessIdentity, hasLiveProcessIdentity, terminateProcessGroup, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
-import { hasCancelFlag, listJobs, loadState, resolveStateDir, saveState, upsertJob, writeCancelFlag, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { hasCancelFlag, listJobs, loadState, resolveStateDir, resolveStateFile, saveState, upsertJob, writeCancelFlag, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -588,6 +588,76 @@ test("shared broker durably observes and reclaims a post-activation regrouped he
 
   assert.ok(Array.isArray(replacementResponse.data));
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 2);
+});
+
+test("shared broker observes a helper spawned after a streaming response before forwarding notifications", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for helper ownership cleanup.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "streaming-helper-after-response");
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_CHILD_IDLE_MS: "1000"
+  }, "streaming-helper-observation");
+  const brokerSession = await ensureBrokerSession(repo, { env });
+  if (!brokerSession) {
+    t.skip("broker socket unavailable in this sandbox");
+    return;
+  }
+
+  let helperPid = null;
+  let appServerPid = null;
+  let registeredChild = null;
+  const client = await CodexAppServerClient.connect(repo, { env });
+  t.after(async () => {
+    await client.close().catch(() => {});
+    await sendBrokerShutdown(brokerSession.endpoint).catch(() => {});
+    for (const pid of [helperPid, appServerPid, brokerSession.pid]) {
+      if (!Number.isFinite(pid)) {
+        continue;
+      }
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Ignore processes already reclaimed by the ownership cleanup path.
+      }
+    }
+    clearBrokerSession(repo);
+  });
+
+  const started = await client.request("thread/start", { cwd: repo, ephemeral: true });
+  await waitFor(() => {
+    registeredChild = loadBrokerChildren(brokerSession.registry).children[0] ?? null;
+    appServerPid = registeredChild?.pid ?? null;
+    return Number.isFinite(appServerPid) && Boolean(registeredChild?.pidIdentity);
+  });
+
+  await client.request("turn/start", {
+    threadId: started.thread.id,
+    input: [{ type: "text", text: "spawn a helper after returning this response" }]
+  });
+  await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) {
+      return false;
+    }
+    const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    helperPid = state.helperPids?.[0] ?? null;
+    return Number.isFinite(helperPid) && Number.isFinite(appServerPid);
+  });
+  await waitFor(() => !hasLiveProcessIdentity(appServerPid, registeredChild.pidIdentity));
+  await waitFor(() => {
+    try {
+      process.kill(helperPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  }, { timeoutMs: 3000 });
 });
 
 test("shared broker tears down a post-activation helper before reporting observation lock contention", async (t) => {
@@ -1287,6 +1357,56 @@ test("a registered broker with a missing socket is not reusable", async (t) => {
   assert.equal(loadReusableBrokerSession(repo, env)?.pid, session.pid);
   fs.unlinkSync(session.endpoint.slice("unix:".length));
   assert.equal(loadReusableBrokerSession(repo, env), null);
+});
+
+test("a crashed broker reclaims its registered child before starting a replacement", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const env = withBrokerOwner({
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir
+  }, "crashed-broker-child-reclaim");
+  const session = await ensureBrokerSession(repo, { env });
+  const helper = spawn(process.execPath, ["-e", SELF_EXPIRING_KEEPALIVE], {
+    cwd: repo,
+    env,
+    detached: true,
+    stdio: "ignore"
+  });
+  helper.unref();
+  const helperOwnership = captureProcessOwnership(helper.pid, { cwd: repo, env });
+  const childRegistration = publishBrokerChild(session.registry, { ownershipSnapshot: helperOwnership });
+  assert.equal(childRegistration.registered, true);
+
+  let replacement = null;
+  t.after(async () => {
+    await sendBrokerShutdown(replacement?.endpoint).catch(() => {});
+    for (const target of [helper, { pid: replacement?.pid }]) {
+      if (!Number.isFinite(target?.pid)) {
+        continue;
+      }
+      try {
+        process.kill(target.pid, "SIGKILL");
+      } catch {
+        // Ignore processes already reclaimed by the recovery path.
+      }
+    }
+    clearBrokerSession(repo);
+  });
+
+  process.kill(session.pid, "SIGKILL");
+  await waitFor(() => !hasLiveProcessIdentity(session.pid, session.pidIdentity));
+  replacement = await ensureBrokerSession(repo, { env });
+
+  assert.notEqual(replacement?.pid, session.pid);
+  await waitFor(() => !hasLiveProcessIdentity(helper.pid, helperOwnership.rootIdentity));
+  assert.equal(loadBrokerChildren(session.registry).children.length, 0);
 });
 
 test("automatic broker falls back without leaving a process when session ownership is unavailable", async (t) => {
@@ -3529,6 +3649,21 @@ test("session cleanup preserves a queued cancel between worker read and pid publ
   enqueueBackgroundTask(workspace, job, request, {
     spawnDetachedTaskWorkerImpl() {}
   });
+  const queuedState = loadState(workspace);
+  const queuedJob = queuedState.jobs.find((candidate) => candidate.id === job.id);
+  const newerJobs = Array.from({ length: 50 }, (_, index) => ({
+    id: `newer-job-${index}`,
+    status: "completed",
+    phase: "done",
+    pid: null,
+    createdAt: new Date(Date.UTC(2026, 6, 29, 9, index, 0)).toISOString(),
+    updatedAt: new Date(Date.UTC(2026, 6, 29, 9, index, 0)).toISOString()
+  }));
+  fs.writeFileSync(
+    resolveStateFile(workspace),
+    `${JSON.stringify({ ...queuedState, jobs: [...newerJobs, { ...queuedJob, updatedAt: "2026-07-28T08:03:00.000Z" }] }, null, 2)}\n`,
+    "utf8"
+  );
 
   await assert.rejects(
     handleTaskWorker(["--cwd", workspace, "--job-id", job.id], {

@@ -159,8 +159,12 @@ class AppServerClientBase {
     }
 
     if (message.method && this.notificationHandler) {
-      this.notificationHandler(/** @type {AppServerNotification} */ (message));
+      this.handleNotification(/** @type {AppServerNotification} */ (message));
     }
+  }
+
+  handleNotification(message) {
+    this.notificationHandler?.(message);
   }
 
   handleServerRequest(message) {
@@ -195,6 +199,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "direct";
+    this.notificationRefreshPromise = Promise.resolve();
   }
 
   async initialize() {
@@ -305,6 +310,29 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     return ownershipSnapshot;
   }
 
+  handleNotification(message) {
+    this.notificationRefreshPromise = this.notificationRefreshPromise.then(async () => {
+      if (this.exitResolved) {
+        return;
+      }
+      try {
+        // Streaming requests return before their turn is complete. Publish a
+        // fresh helper observation before forwarding each later notification
+        // so independently grouped helpers are durable before a crash can
+        // strand them outside both local and registered cleanup.
+        await this.refreshOwnership();
+      } catch (error) {
+        this.startUnexpectedExitCleanup(this.proc?.pid);
+        this.handleExit(error);
+        return;
+      }
+      if (!this.closed) {
+        this.notificationHandler?.(message);
+      }
+    });
+    return this.notificationRefreshPromise;
+  }
+
   async request(method, params) {
     let result;
     let requestError;
@@ -333,12 +361,15 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       return this.unexpectedExitCleanupPromise ?? null;
     }
 
-    this.unexpectedExitCleanupPromise = terminateProcessGroup(pid, {
-      ownershipSnapshot: this.ownershipSnapshot,
-      cwd: this.cwd,
-      env: this.options.env ?? process.env,
-      warnImpl: () => {}
-    })
+    const observationBarrier = this.notificationRefreshPromise ?? Promise.resolve();
+    this.unexpectedExitCleanupPromise = observationBarrier
+      .catch(() => {})
+      .then(() => terminateProcessGroup(pid, {
+        ownershipSnapshot: this.ownershipSnapshot,
+        cwd: this.cwd,
+        env: this.options.env ?? process.env,
+        warnImpl: () => {}
+      }))
       .then((outcome) => {
         this.cleanupOutcome = normalizeProcessCleanupOutcome(outcome);
         if (!outcome.verified) {
@@ -375,6 +406,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
 
     this.closed = true;
+
+    await this.notificationRefreshPromise?.catch(() => {});
 
     if (this.readline) {
       this.readline.close();

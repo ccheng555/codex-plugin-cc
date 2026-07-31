@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { hasCancelFlag, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { hasCancelFlag, readJobFile, removeCancelFlag, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const JOB_CANCELLED_CODE = "JOB_CANCELLED";
@@ -211,6 +211,12 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       completedAt
     });
+    if (terminalStatus === "cancelled") {
+      // The worker has now durably acknowledged the cancellation. Until this
+      // point the tombstone must survive state pruning so a worker that read
+      // the queued request cannot cross the read-to-start race.
+      removeCancelFlag(job.workspaceRoot, job.id);
+    }
     throw error;
   }
 }

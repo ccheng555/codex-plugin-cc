@@ -10,9 +10,11 @@ import {
   acquireBrokerRegistryLock,
   assessBrokerOwners,
   hasLiveBrokerOwnerIdentity,
+  loadBrokerChildren,
   loadBrokerRegistration,
   publishRegisteredBroker,
   registerBrokerOwner,
+  releaseBrokerChild,
   releaseBrokerOwner,
   releaseBrokerRegistryLock,
   resolveBrokerOwnershipRoot
@@ -468,6 +470,41 @@ async function cleanupExistingBrokerSession(cwd, existing, options) {
         const error = new Error(`Broker ownership is ambiguous (${assessment?.reason ?? "unknown"}); cleanup remains report-only.`);
         error.code = "BROKER_CLEANUP_UNVERIFIED";
         throw error;
+      }
+    }
+
+    if (!currentIdentity) {
+      const loadChildren = options.loadBrokerChildrenImpl ?? loadBrokerChildren;
+      const children = loadChildren(registration);
+      if (children?.valid !== true) {
+        const error = new Error(`Registered broker children are invalid (${children?.reason ?? "unknown"}); cleanup remains report-only.`);
+        error.code = "BROKER_CLEANUP_UNVERIFIED";
+        throw error;
+      }
+      const terminateChild = options.terminateBrokerChildImpl ?? terminateProcessTree;
+      const releaseChild = options.releaseBrokerChildImpl ?? releaseBrokerChild;
+      for (const child of children.children) {
+        const outcome = await terminateChild(child.pid, {
+          expectedRootIdentity: child.pidIdentity,
+          ownershipSnapshot: child.ownershipSnapshot,
+          cwd,
+          env
+        });
+        if (outcome?.verified !== true) {
+          const error = new Error("Registered broker child cleanup is unverified; refusing to start a replacement broker.");
+          error.code = "BROKER_CLEANUP_UNVERIFIED";
+          throw error;
+        }
+        const released = releaseChild(registration, {
+          child,
+          cleanupOutcome: outcome,
+          registryLock
+        });
+        if (released?.released !== true) {
+          const error = new Error(`Registered broker child release failed (${released?.reason ?? "unknown"}); refusing to start a replacement broker.`);
+          error.code = "BROKER_CLEANUP_UNVERIFIED";
+          throw error;
+        }
       }
     }
 
