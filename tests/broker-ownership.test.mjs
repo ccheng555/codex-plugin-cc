@@ -6,18 +6,61 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  acquireBrokerRegistryLock,
+  acquireBrokerRegistryLock as acquireBrokerRegistryLockImpl,
   assessBrokerOwners,
   loadBrokerChildren,
-  publishBrokerChild,
-  publishBrokerChildObservation,
+  publishBrokerChild as publishBrokerChildImpl,
+  publishBrokerChildObservation as publishBrokerChildObservationImpl,
   publishBrokerRegistration,
   publishRegisteredBroker,
-  registerBrokerOwner,
-  releaseBrokerChild,
-  releaseBrokerOwner,
+  registerBrokerOwner as registerBrokerOwnerImpl,
+  releaseBrokerChild as releaseBrokerChildImpl,
+  releaseBrokerOwner as releaseBrokerOwnerImpl,
   releaseBrokerRegistryLock
 } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
+
+const TEST_LOCK_PID = 4900;
+const TEST_LOCK_IDENTITY = "4900@Mon Jul 27 00:00:40 2026";
+
+function withTestRegistryLock(options = {}) {
+  const pid = options.pid ?? TEST_LOCK_PID;
+  const pidIdentity = options.pidIdentity ?? (pid === TEST_LOCK_PID
+    ? TEST_LOCK_IDENTITY
+    : `${pid}@Mon Jul 27 00:00:40 2026`);
+  return {
+    ...options,
+    pid,
+    pidIdentity,
+    hasLiveProcessIdentityImpl: () => true,
+    ...(options.hasLiveProcessIdentityImpl
+      ? { hasLiveProcessIdentityImpl: options.hasLiveProcessIdentityImpl }
+      : {})
+  };
+}
+
+function acquireBrokerRegistryLock(registration, options = {}) {
+  return acquireBrokerRegistryLockImpl(registration, withTestRegistryLock(options));
+}
+
+function registerBrokerOwner(registration, options = {}) {
+  return registerBrokerOwnerImpl(registration, withTestRegistryLock(options));
+}
+
+function releaseBrokerOwner(registration, options = {}) {
+  return releaseBrokerOwnerImpl(registration, withTestRegistryLock(options));
+}
+
+function publishBrokerChild(registration, options = {}) {
+  return publishBrokerChildImpl(registration, withTestRegistryLock(options));
+}
+
+function publishBrokerChildObservation(registration, options = {}) {
+  return publishBrokerChildObservationImpl(registration, withTestRegistryLock(options));
+}
+
+function releaseBrokerChild(registration, options = {}) {
+  return releaseBrokerChildImpl(registration, withTestRegistryLock(options));
+}
 
 function makeFixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-ownership-"));
@@ -105,7 +148,8 @@ test("initial publication can make its transaction lock visible atomically", (t)
     },
     env: ownerEnv({ CLAUDE_PLUGIN_DATA: root }, "session-atomic-lock", 5050, "Mon Jul 27 00:00:45 2026"),
     retainRegistryLock: true,
-    hasLiveProcessIdentityImpl: () => true
+    hasLiveProcessIdentityImpl: () => true,
+    getProcessIdentityImpl: (pid) => `${pid}@Mon Jul 27 00:00:41 2026`
   });
 
   assert.equal(registration.registered, true);
@@ -210,6 +254,36 @@ test("initial publication revalidates the broker identity immediately before vis
   assert.deepEqual(fs.readdirSync(path.join(root, "state", "broker-ownership-v1")), []);
 });
 
+test("owner publication revalidates the exact owner while holding the registry lock", (t) => {
+  const { registration, env } = makeFixture(t);
+  const sessionEnv = ownerEnv(env, "session-revalidated", 5060, "Mon Jul 27 00:00:46 2026");
+  const lockOptions = {
+    pid: 5061,
+    pidIdentity: "5061@Mon Jul 27 00:00:47 2026"
+  };
+
+  const rejectedCreate = registerBrokerOwner(registration, {
+    env: sessionEnv,
+    ...lockOptions,
+    hasLiveProcessIdentityImpl: () => false
+  });
+  assert.deepEqual(rejectedCreate, { registered: false, reason: "session-owner-not-live" });
+
+  const registered = registerBrokerOwner(registration, {
+    env: sessionEnv,
+    ...lockOptions,
+    hasLiveProcessIdentityImpl: () => true
+  });
+  assert.equal(registered.registered, true);
+
+  const rejectedExisting = registerBrokerOwner(registration, {
+    env: sessionEnv,
+    ...lockOptions,
+    hasLiveProcessIdentityImpl: () => false
+  });
+  assert.deepEqual(rejectedExisting, { registered: false, reason: "session-owner-not-live" });
+});
+
 test("owner publication fails closed while cleanup holds the registry lock", (t) => {
   const { registration, env } = makeFixture(t);
   const lock = acquireBrokerRegistryLock(registration, {
@@ -246,12 +320,40 @@ test("a well-formed lock whose creator is absent is quarantined before retry", (
 
   const registered = registerBrokerOwner(registration, {
     env: ownerEnv(env, "session-after-stale-lock", 5051, "Mon Jul 27 00:00:46 2026"),
-    getLiveProcessPidsImpl: () => []
+    hasLiveProcessIdentityImpl: (pid) => pid !== 5001
   });
   assert.equal(registered.registered, true);
   const staleRoot = path.join(registration.registryDir, "stale-locks");
   assert.equal(fs.readdirSync(staleRoot).length, 1);
   assert.equal(fs.existsSync(stale.path), false);
+});
+
+test("a reused lock-owner PID does not keep an abandoned registry lock busy", (t) => {
+  const { registration } = makeFixture(t);
+  const staleIdentity = "5006@Mon Jul 27 00:00:36 2026";
+  const stale = acquireBrokerRegistryLock(registration, {
+    pid: 5006,
+    pidIdentity: staleIdentity,
+    now: () => "2026-07-27T00:00:36.000Z"
+  });
+  assert.equal(stale.acquired, true);
+
+  const contender = acquireBrokerRegistryLock(registration, {
+    pid: 5007,
+    pidIdentity: "5007@Mon Jul 27 00:00:37 2026",
+    now: () => "2026-07-27T00:00:37.000Z",
+    getLiveProcessPidsImpl: () => [5006],
+    hasLiveProcessIdentityImpl(pid, identity) {
+      assert.equal(pid, 5006);
+      assert.equal(identity, staleIdentity);
+      return false;
+    }
+  });
+
+  assert.equal(contender.acquired, true);
+  const owner = JSON.parse(fs.readFileSync(path.join(contender.path, "owner.json"), "utf8"));
+  assert.equal(owner.pidIdentity, "5007@Mon Jul 27 00:00:37 2026");
+  assert.deepEqual(releaseBrokerRegistryLock(registration, contender), { released: true });
 });
 
 test("a stale-lock contender cannot quarantine a replacement live lock", (t) => {
@@ -267,7 +369,7 @@ test("a stale-lock contender cannot quarantine a replacement live lock", (t) => 
   const contender = acquireBrokerRegistryLock(registration, {
     pid: 5004,
     now: () => "2026-07-27T00:00:34.000Z",
-    getLiveProcessPidsImpl(pids) {
+    hasLiveProcessIdentityImpl(pid) {
       livenessChecks += 1;
       if (livenessChecks === 1) {
         const staleRoot = path.join(registration.registryDir, "stale-locks");
@@ -279,9 +381,9 @@ test("a stale-lock contender cannot quarantine a replacement live lock", (t) => 
           now: () => "2026-07-27T00:00:33.000Z"
         });
         assert.equal(replacement.acquired, true);
-        return [];
+        return false;
       }
-      return pids.includes(5003) ? [5003] : [];
+      return pid === 5003;
     }
   });
 

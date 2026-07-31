@@ -5,15 +5,51 @@ import path from "node:path";
 import test from "node:test";
 
 import {
-  acquireBrokerRegistryLock,
+  acquireBrokerRegistryLock as acquireBrokerRegistryLockImpl,
   loadBrokerChildren,
-  publishBrokerChild,
+  publishBrokerChild as publishBrokerChildImpl,
   publishBrokerRegistration,
-  registerBrokerOwner,
-  releaseBrokerOwner,
+  registerBrokerOwner as registerBrokerOwnerImpl,
+  releaseBrokerOwner as releaseBrokerOwnerImpl,
   releaseBrokerRegistryLock
 } from "../plugins/codex/scripts/lib/broker-ownership.mjs";
-import { runRegisteredBrokerReaper } from "../plugins/codex/scripts/registered-broker-reaper.mjs";
+import { runRegisteredBrokerReaper as runRegisteredBrokerReaperImpl } from "../plugins/codex/scripts/registered-broker-reaper.mjs";
+
+const TEST_LOCK_PID = 4950;
+const TEST_LOCK_IDENTITY = "4950@Mon Jul 27 00:00:50 2026";
+
+function withTestRegistryLock(options = {}) {
+  return {
+    pid: options.pid ?? TEST_LOCK_PID,
+    pidIdentity: options.pidIdentity ?? TEST_LOCK_IDENTITY,
+    hasLiveProcessIdentityImpl: () => true,
+    ...options
+  };
+}
+
+function acquireBrokerRegistryLock(registration, options = {}) {
+  return acquireBrokerRegistryLockImpl(registration, withTestRegistryLock(options));
+}
+
+function publishBrokerChild(registration, options = {}) {
+  return publishBrokerChildImpl(registration, withTestRegistryLock(options));
+}
+
+function registerBrokerOwner(registration, options = {}) {
+  return registerBrokerOwnerImpl(registration, withTestRegistryLock(options));
+}
+
+function releaseBrokerOwner(registration, options = {}) {
+  return releaseBrokerOwnerImpl(registration, withTestRegistryLock(options));
+}
+
+function runRegisteredBrokerReaper(options = {}) {
+  return runRegisteredBrokerReaperImpl({
+    ...options,
+    acquireBrokerRegistryLockImpl:
+      options.acquireBrokerRegistryLockImpl ?? ((registration) => acquireBrokerRegistryLock(registration))
+  });
+}
 
 function ownerEnv(env, sessionId, pid) {
   const startedAt = `Mon Jul 27 00:${String(pid % 60).padStart(2, "0")}:00 2026`;

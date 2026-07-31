@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { getLiveProcessPids, hasLiveProcessIdentity } from "./process.mjs";
+import { getLiveProcessPids, getProcessIdentity, hasLiveProcessIdentity } from "./process.mjs";
 
 export const BROKER_OWNERSHIP_VERSION = 1;
 export const SESSION_OWNER_PID_ENV = "CODEX_COMPANION_SESSION_OWNER_PID";
@@ -143,6 +143,8 @@ function validRegistryLock(registration, lock) {
       lock?.acquired === true &&
       lock.brokerKey === registration.brokerKey &&
       isRegistryLockToken(lock.token) &&
+      isSafePid(lock.pid) &&
+      isPidIdentity(lock.pid, lock.pidIdentity) &&
       lock.path === path.join(registration.registryDir, REGISTRY_LOCK_DIR_NAME)
   );
 }
@@ -151,6 +153,18 @@ function createPreparedRegistryLock(registration, preparedRegistryDir, options =
   const pid = options.pid ?? process.pid;
   if (!isSafePid(pid)) {
     return { acquired: false, reason: "registry-lock-owner-invalid" };
+  }
+  const getProcessIdentityImpl = options.getProcessIdentityImpl ?? getProcessIdentity;
+  let pidIdentity = options.pidIdentity ?? null;
+  if (!pidIdentity) {
+    try {
+      pidIdentity = getProcessIdentityImpl(pid);
+    } catch {
+      return { acquired: false, reason: "registry-lock-owner-identity-unavailable" };
+    }
+  }
+  if (!isPidIdentity(pid, pidIdentity)) {
+    return { acquired: false, reason: "registry-lock-owner-identity-unavailable" };
   }
   const token = randomUUID();
   const preparedLockPath = path.join(preparedRegistryDir, REGISTRY_LOCK_DIR_NAME);
@@ -161,12 +175,15 @@ function createPreparedRegistryLock(registration, preparedRegistryDir, options =
     brokerKey: registration.brokerKey,
     token,
     pid,
+    pidIdentity,
     acquiredAt: (options.now ?? (() => new Date().toISOString()))()
   });
   return {
     acquired: true,
     brokerKey: registration.brokerKey,
     token,
+    pid,
+    pidIdentity,
     path: path.join(registration.registryDir, REGISTRY_LOCK_DIR_NAME)
   };
 }
@@ -176,7 +193,10 @@ export function acquireBrokerRegistryLock(
   {
     now = () => new Date().toISOString(),
     pid = process.pid,
-    getLiveProcessPidsImpl = getLiveProcessPids
+    pidIdentity: suppliedPidIdentity = null,
+    getProcessIdentityImpl = getProcessIdentity,
+    getLiveProcessPidsImpl = getLiveProcessPids,
+    hasLiveProcessIdentityImpl = hasLiveProcessIdentity
   } = {}
 ) {
   if (!validRegistrationReference(registration)) {
@@ -184,6 +204,17 @@ export function acquireBrokerRegistryLock(
   }
   requirePrivateDirectory(registration.registryRoot);
   requirePrivateDirectory(registration.registryDir);
+  let pidIdentity = suppliedPidIdentity;
+  if (!pidIdentity) {
+    try {
+      pidIdentity = getProcessIdentityImpl(pid);
+    } catch {
+      return { acquired: false, reason: "registry-lock-owner-identity-unavailable" };
+    }
+  }
+  if (!isPidIdentity(pid, pidIdentity)) {
+    return { acquired: false, reason: "registry-lock-owner-identity-unavailable" };
+  }
   const lockPath = path.join(registration.registryDir, REGISTRY_LOCK_DIR_NAME);
   const token = randomUUID();
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -196,11 +227,12 @@ export function acquireBrokerRegistryLock(
         brokerKey: registration.brokerKey,
         token,
         pid,
+        pidIdentity,
         acquiredAt: now()
       });
       try {
         fs.renameSync(preparedPath, lockPath);
-        return { acquired: true, brokerKey: registration.brokerKey, token, path: lockPath };
+        return { acquired: true, brokerKey: registration.brokerKey, token, pid, pidIdentity, path: lockPath };
       } catch (error) {
         if (error?.code !== "EEXIST" && error?.code !== "ENOTEMPTY") {
           throw error;
@@ -227,17 +259,29 @@ export function acquireBrokerRegistryLock(
       existingOwner.kind !== "registry-lock" ||
       existingOwner.brokerKey !== registration.brokerKey ||
       !isRegistryLockToken(existingOwner.token) ||
-      !isSafePid(existingOwner.pid)
+      !isSafePid(existingOwner.pid) ||
+      (existingOwner.pidIdentity != null && !isPidIdentity(existingOwner.pid, existingOwner.pidIdentity))
     ) {
       return { acquired: false, reason: "registry-lock-malformed", path: lockPath };
     }
-    let live;
+    let live = false;
     try {
-      live = getLiveProcessPidsImpl([existingOwner.pid]);
+      if (existingOwner.pidIdentity == null) {
+        const livePids = getLiveProcessPidsImpl([existingOwner.pid]);
+        if (!Array.isArray(livePids)) {
+          return { acquired: false, reason: "registry-lock-liveness-unavailable", path: lockPath };
+        }
+        live = livePids.includes(existingOwner.pid);
+      } else {
+        live = hasLiveProcessIdentityImpl(existingOwner.pid, existingOwner.pidIdentity);
+        if (typeof live !== "boolean") {
+          return { acquired: false, reason: "registry-lock-liveness-unavailable", path: lockPath };
+        }
+      }
     } catch {
       return { acquired: false, reason: "registry-lock-liveness-unavailable", path: lockPath };
     }
-    if (!Array.isArray(live) || live.includes(existingOwner.pid)) {
+    if (live) {
       return { acquired: false, reason: "registry-busy", path: lockPath };
     }
 
@@ -267,7 +311,9 @@ export function releaseBrokerRegistryLock(registration, lock) {
       owner?.version !== BROKER_OWNERSHIP_VERSION ||
       owner.kind !== "registry-lock" ||
       owner.brokerKey !== registration.brokerKey ||
-      owner.token !== lock.token
+      owner.token !== lock.token ||
+      owner.pid !== lock.pid ||
+      owner.pidIdentity !== lock.pidIdentity
     ) {
       return { released: false, reason: "registry-lock-mismatch" };
     }
@@ -451,6 +497,7 @@ export function publishRegisteredBroker({
   env = process.env,
   now = () => new Date().toISOString(),
   hasLiveProcessIdentityImpl = hasLiveProcessIdentity,
+  getProcessIdentityImpl = getProcessIdentity,
   retainRegistryLock = false
 }) {
   const registryRoot = resolveBrokerOwnershipRoot(env);
@@ -507,7 +554,7 @@ export function publishRegisteredBroker({
     createImmutableJson(path.join(preparedDir, "broker.json"), broker);
     createImmutableJson(path.join(preparedDir, "owners", `${owner.ownerKey}.json`), ownerRecord);
     const registryLock = retainRegistryLock
-      ? createPreparedRegistryLock(registration, preparedDir, { now })
+      ? createPreparedRegistryLock(registration, preparedDir, { now, getProcessIdentityImpl })
       : null;
     if (retainRegistryLock && registryLock?.acquired !== true) {
       return { registered: false, reason: registryLock?.reason ?? "registry-lock-unavailable" };
@@ -547,6 +594,28 @@ export function registerBrokerOwner(registration, options = {}) {
     return { registered: false, reason: "session-owner-unavailable" };
   }
   const locked = withBrokerRegistryLock(registration, options, () => {
+    const hasLiveIdentity = options.hasLiveProcessIdentityImpl ?? hasLiveProcessIdentity;
+    const ownerIsLive = () => {
+      try {
+        return hasLiveIdentity(owner.pid, owner.identity) === true;
+      } catch {
+        return false;
+      }
+    };
+    const ownerPath = path.join(registration.registryDir, "owners", `${owner.ownerKey}.json`);
+    if (fs.existsSync(ownerPath)) {
+      const existing = readJson(ownerPath);
+      if (!validOwnerRecord(existing, ownerPath, registration)) {
+        const error = new Error(`Invalid existing broker owner row at ${ownerPath}.`);
+        error.code = "BROKER_OWNERSHIP_COLLISION";
+        throw error;
+      }
+      if (!ownerIsLive()) {
+        return { registered: false, reason: "session-owner-not-live" };
+      }
+      fs.chmodSync(ownerPath, 0o600);
+      return { registered: true, ownerKey: owner.ownerKey, path: ownerPath, owner: existing };
+    }
     const payload = {
       version: BROKER_OWNERSHIP_VERSION,
       kind: "owner",
@@ -557,16 +626,8 @@ export function registerBrokerOwner(registration, options = {}) {
       pidIdentity: owner.identity,
       registeredAt: now()
     };
-    const ownerPath = path.join(registration.registryDir, "owners", `${owner.ownerKey}.json`);
-    if (fs.existsSync(ownerPath)) {
-      const existing = readJson(ownerPath);
-      if (!validOwnerRecord(existing, ownerPath, registration)) {
-        const error = new Error(`Invalid existing broker owner row at ${ownerPath}.`);
-        error.code = "BROKER_OWNERSHIP_COLLISION";
-        throw error;
-      }
-      fs.chmodSync(ownerPath, 0o600);
-      return { registered: true, ownerKey: owner.ownerKey, path: ownerPath, owner: existing };
+    if (!ownerIsLive()) {
+      return { registered: false, reason: "session-owner-not-live" };
     }
     createImmutableJson(ownerPath, payload);
     return { registered: true, ownerKey: owner.ownerKey, path: ownerPath, owner: payload };

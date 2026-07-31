@@ -829,6 +829,61 @@ test("existing broker reuse holds the registry lock through owner publication", 
   assert.equal(heldLock, null);
 });
 
+test("existing broker reuse refuses an owner that dies at the publication boundary", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Unix process identities are required for the registered broker contract.");
+    return;
+  }
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-ok");
+  const baseEnv = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: runtimePluginDataDir,
+    [SESSION_OWNER_PID_ENV]: String(process.pid),
+    [SESSION_OWNER_IDENTITY_ENV]: getProcessIdentity(process.pid)
+  };
+  const envA = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "publication-owner-a" };
+  const envB = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "publication-owner-b" };
+  const first = await ensureBrokerSession(repo, { env: envA });
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env: envA,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "publication-owner-a" })
+    });
+  });
+
+  let publicationChecks = 0;
+  const reused = await ensureBrokerSession(repo, {
+    env: envB,
+    registerBrokerOwnerImpl(registration, options) {
+      return registerBrokerOwner(registration, {
+        ...options,
+        hasLiveProcessIdentityImpl(pid, identity) {
+          publicationChecks += 1;
+          assert.equal(pid, process.pid);
+          assert.equal(identity, envB[SESSION_OWNER_IDENTITY_ENV]);
+          return false;
+        }
+      });
+    }
+  });
+
+  assert.equal(reused, null);
+  assert.equal(publicationChecks, 1);
+  assert.equal(loadBrokerSession(repo)?.pid, first.pid);
+  const registration = loadBrokerRegistration({
+    endpoint: first.endpoint,
+    brokerIdentity: first.pidIdentity,
+    env: envB
+  });
+  const owners = fs.readdirSync(path.join(registration.registryDir, "owners"))
+    .map((name) => JSON.parse(fs.readFileSync(path.join(registration.registryDir, "owners", name), "utf8")));
+  assert.equal(owners.some((owner) => owner.sessionId === "publication-owner-b"), false);
+});
+
 test("deterministic broker launch lock never splits across fallback resources", async (t) => {
   const repo = makeTempDir();
   const port = brokerLaunchLockPort(repo);
